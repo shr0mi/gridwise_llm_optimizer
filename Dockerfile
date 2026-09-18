@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py schemas.py llm.py optimizer.py ./
+COPY main.py schemas.py llm.py rules.py optimizer.py replay.py ./
 
 RUN useradd --create-home --uid 10001 appuser
 USER appuser

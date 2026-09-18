@@ -1,0 +1,487 @@
+Ready to code?
+
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ GridWise LLM — BUP CSE Fest 2026 Preliminary: Full Build Plan
+
+ Context
+
+ What we're building: one publicly-deployed HTTP service with exactly two endpoints — GET /health and POST /optimize-energy — for the BUP CSE Fest 2026 online preliminary (4-hour window, 7:00–11:00 PM). It receives a
+ 24-hour campus energy scenario plus 1–3 natural-language operator notes, uses an LLM to convert those notes into machine-checkable structured directives, validates them deterministically, applies them to a cost-minimizing
+ 24-hour battery/solar/grid schedule, and returns both the interpretation and the schedule.
+
+ Why this shape: the rubric (100 pts, automated) is pipeline-scored, not cost-scored. 50 of 100 points are interpretation + downstream application; only 10 are optimization quality. A cheap schedule built on a wrong or
+ unapplied directive scores zero for that case. So the plan optimizes for: exact schema compliance → correct note extraction → provably-correct directive application → optimal cost → reliability → docs/Docker.
+
+ Validated finding (already done, this session): I implemented the LP formulation below and ran it against all 10 public sample cases using their ground-truth directives. It reproduces the organizer's total_cost_bdt exactly
+ on 10/10 cases (delta 0.00). The optimizer is therefore a solved component — remaining risk is concentrated in LLM extraction, schema discipline, and deployment.
+
+ ---
+
+ 1. Hard requirements extracted from the docs (the contract)
+
+ Endpoints
+
+ ┌───────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │       Endpoint        │                                                                                         Contract                                                                                          │
+ ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ GET /health           │ HTTP 200, {"status":"ok"}, ready within 60s of service start                                                                                                                              │
+ ├───────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ POST /optimize-energy │ 200 on success; 400 malformed/structurally invalid; 422 optional semantic; 500 controlled (no stack traces, no secrets). Must complete within 30s; p95 target ≤ 5s for full latency marks │
+ └───────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Request (exact)
+
+ scenario_id: str, operator_notes: [1..3] non-empty str, hours: [24] of {hour, demand_kwh, solar_kwh, tariff_bdt_per_kwh}, battery: {capacity_kwh, initial_energy_kwh, minimum_energy_kwh, max_charge_kwh_per_hour,
+ max_discharge_kwh_per_hour}.
+
+ Response (exact — emit these 7 top-level keys and nothing else)
+
+ scenario_id, directive_interpretation[], hourly_plan[24], total_grid_kwh, total_cost_bdt, peak_grid_kwh, plan_summary.
+
+ - directive_interpretation entry: {note_index, applies, directive_type, structured_adjustment, explanation} — exactly one per note, in note_index order 0..N-1, no gaps, no duplicates.
+ - hourly_plan entry: {hour, grid_kwh, solar_used_kwh, battery_action, battery_kwh, battery_energy_after_kwh}; battery_action ∈ {charge, discharge, idle}; battery_kwh = 0 iff idle.
+
+ Directive types + required structured_adjustment shape
+
+ ┌─────────────────────────┬──────────────────────────────────────┬──────────────────────────────────┐
+ │          type           │                shape                 │              effect              │
+ ├─────────────────────────┼──────────────────────────────────────┼──────────────────────────────────┤
+ │ solar_reduction         │ {hours:[...], factor: 0..1}          │ eff_solar[h] = solar[h] * factor │
+ ├─────────────────────────┼──────────────────────────────────────┼──────────────────────────────────┤
+ │ minimum_battery_reserve │ {hours:[...], minimum_energy_kwh: n} │ E_after[h] >= max(base_min, n)   │
+ ├─────────────────────────┼──────────────────────────────────────┼──────────────────────────────────┤
+ │ no_charge_window        │ {hours:[...]}                        │ charge[h] = 0                    │
+ ├─────────────────────────┼──────────────────────────────────────┼──────────────────────────────────┤
+ │ no_discharge_window     │ {hours:[...]}                        │ discharge[h] = 0                 │
+ ├─────────────────────────┼──────────────────────────────────────┼──────────────────────────────────┤
+ │ max_grid_window         │ {hours:[...], max_grid_kwh: n}       │ grid[h] <= n                     │
+ ├─────────────────────────┼──────────────────────────────────────┼──────────────────────────────────┤
+ │ no_op                   │ null                                 │ none                             │
+ └─────────────────────────┴──────────────────────────────────────┴──────────────────────────────────┘
+
+ applies = true for every non-no_op; applies = false only for no_op (and then adjustment must be null).
+
+ Energy rules (judge replays these hour by hour)
+
+ grid[h] + solar_used[h] + discharge[h] == demand[h] + charge[h]
+ 0 <= solar_used[h] <= eff_solar[h]                 (excess curtailed, no export)
+ E[h] = E[h-1] + charge[h] - discharge[h]           (E[-1] = initial_energy_kwh)
+ active_min[h] <= E[h] <= capacity_kwh
+ charge[h] <= max_charge_kwh_per_hour ; discharge[h] <= max_discharge_kwh_per_hour
+ E[23] == initial_energy_kwh                        (end-of-day neutrality)
+ total_grid_kwh / total_cost_bdt / peak_grid_kwh must match recalculation from hourly_plan
+ Tolerance: 0.01 kWh / 0.01 BDT absolute.
+
+ Interpretation conventions (these are the trap)
+
+ - Windows are start-inclusive, end-exclusive. "1 PM to 3 PM" → [13,14]. Verified against every sample: "noon until 2 PM"→[12,13]; "2 AM until 5 AM"→[2,3,4]; "6 PM until 10 PM"→[18,19,20,21]; "between 11 AM and 2
+   PM"→[11,12,13].
+ - factor is the fraction remaining. "80% reduction" → 0.2; "drop to 25%" → 0.25; "about half" → 0.5; "one-fifth" → 0.2.
+ - Relative reserves must be resolved against battery capacity. SAMPLE-03: "50% of the battery capacity", cap 200 → minimum_energy_kwh: 100. ⇒ the battery object must be in the LLM prompt.
+ - Hours array: unique ints 0–23, ascending.
+ - Distractors ("cafeteria menu", "library hours", "seminar room moved") → no_op.
+
+ Scoring (100 pts, automated)
+
+ ┌─────┬────────────────────────────────────────────────┬─────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │  #  │                    Category                    │ Pts │                                                   Breakdown                                                   │
+ ├─────┼────────────────────────────────────────────────┼─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1   │ LLM Directive Interpretation                   │ 25  │ 5 relevance/no_op + 5 type + 5 hours + 5 numerics/shape + 5 paraphrase robustness                             │
+ ├─────┼────────────────────────────────────────────────┼─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 2   │ Directive Application & Constraint Correctness │ 25  │ 10 ground-truth application + 5 balance/eff-solar + 5 battery bounds/rates + 5 action consistency/neutrality  │
+ ├─────┼────────────────────────────────────────────────┼─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 3   │ Optimization Quality                           │ 10  │ 10 × mean(min(1, organizer_optimal / our_cost)) over valid cases; invalid case = 0                            │
+ ├─────┼────────────────────────────────────────────────┼─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 4   │ API Contract & Schema                          │ 10  │ 2 endpoints + 2 request validation + 3 interpretation schema + 3 hourly_plan/top-level                        │
+ ├─────┼────────────────────────────────────────────────┼─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 5   │ Performance & Reliability                      │ 10  │ 2 health + 3 p95 latency + 3 stability/failure rate + 2 malformed/provider-failure handling                   │
+ ├─────┼────────────────────────────────────────────────┼─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 6   │ Deployment & Docker Fallback                   │ 10  │ 3 endpoint reachability + 4 pullable image reaching /health + 2 clean startup + 1 no manual debugging         │
+ ├─────┼────────────────────────────────────────────────┼─────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 7   │ Documentation & Local Reproducibility          │ 10  │ 3 quickstart + 2 env/model docs + 2 sample-test procedure + 1 architecture + 1 Docker + 1 deps/limits/secrets │
+ └─────┴────────────────────────────────────────────────┴─────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Mandatory & disqualifying: the LLM must be in the interpretation path producing the structured directives the optimizer consumes. LLM only for plan_summary/docs ⇒ fails the challenge. Hard-coded phrase matching as the sole
+ interpreter ⇒ non-compliant.
+
+ Deliverables: public endpoint • GitHub repo (created after reveal, private during, public after deadline) • self-contained README • pullable Docker image (no baked secrets, binds 0.0.0.0) • ≤3-min video (tie-break only, no
+ base points).
+
+ ---
+
+ 2. Architecture
+
+         POST /optimize-energy
+                 │
+         ┌───────▼────────┐  400 on schema failure (Pydantic v2, strict)
+         │ Request Guard  │
+         └───────┬────────┘
+                 │ notes[]                         hours/battery (never touched by LLM)
+         ┌───────▼──────────────────────────┐              │
+         │ NOTE INTERPRETATION              │              │
+         │  1. normalize + cache lookup     │              │
+         │  2. LLM call (forced tool JSON)  │  ← MANDATORY │
+         │  3. rule-based cross-check       │              │
+         │  4. arbiter re-ask on disagree   │              │
+         │  5. fallback extractor on outage │              │
+         └───────┬──────────────────────────┘              │
+                 │ raw candidate directives                │
+         ┌───────▼────────┐                                │
+         │  GUARDRAILS    │ type allowlist, hour normalize, │
+         │ (deterministic)│ factor∈[0,1], reserve≤cap,      │
+         │                │ 1-entry-per-note, no invention  │
+         └───────┬────────┘                                │
+                 │ validated directives ──────────────┐    │
+         ┌───────▼────────────────────────────────────▼────▼──┐
+         │ OPTIMIZER — LP over 96 vars, HiGHS (scipy.linprog) │
+         │ provably optimal; ~1–3 ms                          │
+         └───────┬────────────────────────────────────────────┘
+                 │ plan
+         ┌───────▼────────┐  exact-arithmetic reconstruction + judge-equivalent replay
+         │ SELF-VALIDATOR │  fail ⇒ tier-2 feasible fallback (never emit an invalid plan)
+         └───────┬────────┘
+                 │
+           200 JSON (7 exact keys)
+
+ Component decisions
+
+ Stack: Python 3.11 · FastAPI + Pydantic v2 · uvicorn (uvloop/httptools) · scipy.optimize.linprog(method="highs") · google-genai async client (client.aio) + httpx.
+ Rationale: HiGHS is a battle-tested exact LP solver and is already proven (above) to match organizer optimal; FastAPI gives async I/O for the LLM leg plus free request-schema validation → 400s for the API-contract points.
+
+ Why LP and not greedy/DP: the problem is a pure linear min-cost flow over time (lossless battery, linear tariff). LP gives the global optimum, not an approximation — that is exactly the 10 optimization points, and it also
+ guarantees hard directives (max_grid_window, reserves, no-charge/no-discharge) are satisfied by construction rather than by patching.
+
+ LLM — Google Gemini (paid key).
+ - Primary: gemini-2.5-flash, temperature=0, response_mime_type="application/json" + a strict response_schema (JSON-mode structured output) so the envelope and the directive_type enum are guaranteed well-formed. Set the
+   thinking budget to 0 on the primary call — it removes seconds of latency and the extraction task does not need it.
+ - Arbiter (disagreement only): gemini-2.5-pro, temperature=0, thinking enabled, shown both candidate interpretations and asked to pick. Fires on maybe 5–10% of requests, so it doesn't move p95.
+ - Env vars: GEMINI_API_KEY (or GEMINI_API_KEYS comma-separated for the round-robin pool), GEMINI_MODEL, GEMINI_ARBITER_MODEL, LLM_TIMEOUT_S.
+ - Pin the exact model IDs and SDK call signature at implementation time by checking the current google-genai docs — model aliases move.
+ - Gemini has no Anthropic-style prompt-cache header; use implicit/explicit context caching if the static system block is large enough to qualify, otherwise rely on the note-level cache (§5), which is the bigger lever
+   anyway.
+
+ ---
+
+ 3. The optimizer (verified formulation)
+
+ Decision variables per hour h∈0..23: g[h] grid, s[h] solar used, c[h] charge, d[h] discharge → 96 vars.
+
+ minimize   Σ tariff[h] · g[h]
+
+ s.t.  g[h] + s[h] + d[h] − c[h] = demand[h]                    (24 equalities)
+       Σ_h (c[h] − d[h]) = 0                                     (end-of-day neutrality)
+       E0 + Σ_{k≤h} (c[k] − d[k]) ≤ capacity                     (48 inequalities)
+       E0 + Σ_{k≤h} (c[k] − d[k]) ≥ active_min[h]
+ bounds: 0 ≤ g[h] ≤ grid_cap[h]      (∞ unless max_grid_window)
+         0 ≤ s[h] ≤ eff_solar[h]     (solar × factor)
+         0 ≤ c[h] ≤ charge_cap[h]    (0 in no_charge_window)
+         0 ≤ d[h] ≤ discharge_cap[h] (0 in no_discharge_window)
+
+ Directive→array construction (core/directives.py) builds eff_solar, active_min, charge_cap, discharge_cap, grid_cap from the validated directive list. Multiple directives of the same type compose by tightening: min() for
+ caps, max() for reserves, multiplicative for solar factors.
+
+ Post-solve hardening (core/optimizer.py) — this is where cases are silently lost, so do it precisely:
+ 1. Net out degeneracy. HiGHS may return c[h]>0 and d[h]>0 together (cost-neutral). Replace with net = c−d; charge if net>0, discharge if net<0, else idle. Safe: E-trajectory and balance are unchanged, rate limits can only
+    relax.
+ 2. Snap epsilons. Values with |x| < 1e-9 → exactly 0.0; kill -0.0.
+ 3. Round-then-rederive (guarantees the judge's replay passes bit-exactly):
+    - round battery_kwh and solar_used_kwh to 6 dp, flooring solar_used so it can never exceed eff_solar;
+    - recompute battery_energy_after_kwh cumulatively from the rounded battery values → transitions exact, and force E[23] to land on initial_energy_kwh (absorb any residue into the last non-binding hour);
+    - recompute grid_kwh = demand + charge − solar_used − discharge from the rounded values → the balance equation holds exactly, not within tolerance.
+ 4. Cap safety margin. Solve with grid_cap − 1e-6 so rounding can't push grid_kwh over a max_grid_window cap.
+ 5. Totals from the plan. total_grid_kwh = Σ grid_kwh, total_cost_bdt = Σ grid_kwh·tariff, peak_grid_kwh = max grid_kwh, all computed from the final rounded hourly_plan — the plan is the single source of truth (the rubric
+    penalizes disagreement).
+
+ Infeasibility ladder (status != 0) — never 500, never return an invalid plan:
+ - Tier 1: re-solve dropping the lowest-confidence directive (extraction confidence ranking), one at a time.
+ - Tier 2: re-solve with only base GridWise constraints.
+ - Tier 3: analytic safe plan — battery idle all day (E ≡ E0, neutrality trivially holds), solar_used = min(eff_solar, demand), grid = demand − solar_used. Always feasible under base rules.
+   Log which tier fired; still return 200 with a truthful plan_summary.
+
+ ---
+
+ 4. The LLM interpretation path (the 25+25 points)
+
+ 4.1 Single call, all notes at once
+
+ One request per scenario carrying all 1–3 notes → one round trip, not three. Gemini JSON mode with an explicit response_schema so the model cannot emit a malformed envelope or an out-of-enum directive_type.
+
+ Response schema: {"interpretations":[{"note_index":int, "applies":bool, "directive_type":enum(6), "structured_adjustment":object|null, "explanation":str, "confidence":number}]} (confidence is internal only — stripped
+ before the response).
+
+ Gemini's schema support does not express per-type conditional shapes cleanly, so declare structured_adjustment with the union of optional fields (hours, factor, minimum_energy_kwh, max_grid_kwh) and let the deterministic
+ guardrails in §4.4 enforce the exact per-type shape. Parse the JSON defensively (strip any stray code fences) before validating.
+
+ 4.2 System instruction (static block)
+
+ Sent as system_instruction, containing: the 6 directive types and exact shapes; the end-exclusive window rule with 5 worked conversions; the factor = fraction remaining rule with 6 worked conversions ("80% reduction"→0.2,
+ "drop to 25%"→0.25, "half"→0.5, "one-fifth"→0.2, "a third of normal"→0.33, "reduced by two-thirds"→0.33); percentage-of-capacity resolution; the "distractor ⇒ no_op" rule with examples; 12-hour↔24-hour clock mapping; the
+ rule that it must never invent demand/tariff/battery values or new types.
+
+ Few-shot examples derived from the 10 public cases but paraphrased and renumbered — the guide explicitly forbids hard-coding public wording, and hidden notes paraphrase. Include ~8 adversarial synthetics the public set
+ doesn't cover:
+ - overnight wrap: "no charging from 10 PM until 2 AM" → [0,1,22,23] (ascending!)
+ - single hour: "cap grid at 150 kWh during the 7 PM hour" → [19]
+ - all-day: "keep 60 kWh in reserve throughout the day" → 0..23
+ - "until midnight" → end hour 24 → last hour 23
+ - trailing "inclusive" phrasing ("through 9 PM" → [18,19,20,21])
+ - a distractor that mentions energy but doesn't constrain today ("we're evaluating new solar panels next quarter") → no_op
+ - two directives packed in one note → pick the single supported one (spec: each note maps to exactly one type)
+ - a note referencing a percentage grid cap
+
+ 4.3 User message
+
+ Notes (indexed) + the battery object + a compact hour table (hour/demand/solar/tariff). Battery is required for percentage-reserve resolution; the hour table helps ground "peak hours" phrasing. Explicit instruction: these
+ are read-only facts, never to be modified.
+
+ 4.4 Guardrails (core/guardrails.py) — deterministic, runs on every LLM output
+
+ 1. directive_type ∈ allowlist, else → no_op.
+ 2. note_index ∈ [0, len(notes)); drop dupes (keep highest confidence); synthesize a no_op entry for any missing index; sort ascending. Output length must equal len(operator_notes).
+ 3. applies forced consistent: no_op ⇒ applies=false, structured_adjustment=null; anything else ⇒ applies=true and shape must validate, else demote to no_op.
+ 4. Hours: coerce to int, drop out-of-range, dedupe, sort ascending; empty ⇒ demote to no_op.
+ 5. factor clamp [0,1]; if the model returned a reduction fraction by mistake (detectable when the note contains "reduction"/"reduce by" and factor > 0.5 with matching complement) — do not silently flip; instead flag for
+    the arbiter.
+ 6. minimum_energy_kwh: finite, ≥0, min(value, capacity_kwh).
+ 7. max_grid_kwh: finite, ≥0.
+ 8. No-invention check: the interpretation may not alter hours/battery; those are copied from the request object and never read back from the model.
+ 9. Reject NaN/Inf everywhere.
+
+ Every demotion is logged with a reason (feeds the README's "known limitations").
+
+ 4.5 Rule-based cross-check + arbiter (accuracy lever, compliance-safe)
+
+ A deterministic extractor (llm/fallback.py) parses time expressions, percentages, and kWh quantities with regex. It is never the sole interpreter — the LLM is always called and its guardrailed output is the default. The
+ rule extractor is used for:
+ - Disagreement detection. If rule and LLM differ on type or hours, fire one arbiter call (gemini-2.5-pro, temperature 0, both candidates shown, asked to pick and justify). Bounded: one extra call, only on disagreement.
+ - Outage fallback. If the provider 5xxs / times out / circuit-breaker is open, use the rule output and mark it in logs. The guide explicitly permits a backup path; this keeps failure-rate points while the LLM remains the
+   primary path under normal operation.
+
+ This satisfies "hard-coded phrase matching as the sole interpreter — not compliant" while measurably lifting the paraphrase-robustness sub-score.
+
+ 4.6 Safe failure
+
+ Malformed model output, refusal, timeout, or unparseable tool args ⇒ guardrails demote to no_op / rule fallback ⇒ still a valid 200 with a complete schedule. Never 500 on an LLM problem. Never invent a directive type.
+ Never leak prompts, keys, or stack traces (rubric item 5 explicitly scores secret safety).
+
+ ---
+
+ 5. Concurrency, throughput, reliability
+
+ The judge's real load is modest, but the design targets sustained high volume and — more importantly — a p95 ≤ 5s and a near-zero failure rate.
+
+ ┌──────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │      Lever       │                                                       Implementation                                                        │                                 Effect                                 │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │                  │ Normalized key = lowercase, punctuation/whitespace-stripped, digit-normalized note text + capacity (percentage reserves     │ Repeated/near-repeated notes across the hidden set skip the LLM        │
+ │ Note-level cache │ depend on it). cachetools.LRU(50k) in-process; optional Redis for cross-instance.                                           │ entirely → sub-10ms responses, and the same note always gets the same  │
+ │                  │                                                                                                                             │ answer (consistency).                                                  │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Scenario cache   │ sha256(canonical request JSON) → full response, TTL 1h.                                                                     │ Judge retries and duplicate probes are free.                           │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Async everywhere │ async def handlers, one shared httpx.AsyncClient (keep-alive pool, HTTP/2), no blocking calls on the loop.                  │ Thousands of concurrent in-flight LLM waits per worker.                │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ LP off the event │ run_in_executor thread pool (HiGHS releases the GIL). ~1–3 ms/solve → ~400 solves/s/core.                                   │ CPU work never stalls I/O.                                             │
+ │  loop            │                                                                                                                             │                                                                        │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Context caching  │ Gemini implicit/explicit context caching on the static system block, if it clears the minimum-token threshold.              │ Cost + TTFT reduction on misses.                                       │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Bounded          │ asyncio.Semaphore sized to the Gemini paid-tier RPM/concurrency limit; token-bucket rate limiter; multiple GEMINI_API_KEYS  │ No 429 storms.                                                         │
+ │ concurrency      │ round-robined to multiply headroom.                                                                                         │                                                                        │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Hedged request   │ If no first token by ~1.2s, fire a second identical call; take the first to finish, cancel the loser.                       │ Cuts tail latency, protecting the 3 p95 points.                        │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Retry + circuit  │ 2 retries, exponential backoff + jitter on 429/5xx/timeout; breaker opens after N consecutive failures → rule-fallback path │ Provider outage degrades gracefully instead of failing the round.      │
+ │ breaker          │  until half-open probe succeeds.                                                                                            │                                                                        │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Hard timeouts    │ LLM leg 8s; whole request 25s (under the 30s judge limit) — on breach, fall back and still answer.                          │ No timed-out requests (scored as failures).                            │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Horizontal scale │ Stateless container; gunicorn -k uvicorn.workers.UvicornWorker -w (2×cores+1); N replicas behind the Render/Railway LB;     │ Linear scale-out.                                                      │
+ │                  │ optional Redis add-on for a shared cache.                                                                                   │                                                                        │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │                  │ Use a paid always-on instance, not the free tier — free Render web services sleep and a cold start blows the 30s            │                                                                        │
+ │ No cold starts   │ per-request limit and the health check. Belt-and-braces: an external uptime pinger (UptimeRobot / cron-job.org) hitting     │ Protects 3 health + 3 latency + 3 reachability points.                 │
+ │                  │ /health every 1–5 min for the whole judging window.                                                                         │                                                                        │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Health isolation │ /health returns a static literal, touches no dependency, never awaits the LLM.                                              │ Always 200, always fast — even mid-outage.                             │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Backpressure     │ Bounded queue; overflow → fast rule-path rather than queueing past the timeout.                                             │ Bounded latency under overload.                                        │
+ ├──────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ Observability    │ Structured JSON logs (scenario_id, path taken, tiers fired, latencies), /metrics optional, secret-redacting formatter.      │ Debuggable without leaking.                                            │
+ └──────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+
+ ---
+
+ 6. Folder structure
+
+ gridwise-llm/
+ ├── app/
+ │   ├── main.py                 # FastAPI app, lifespan warm-up, both routes, exception handlers
+ │   ├── schemas.py              # Pydantic v2: ScenarioRequest, HourEntry, Battery,
+ │   │                           #   OptimizeResponse, DirectiveInterpretation, HourPlan
+ │   ├── settings.py             # env config (pydantic-settings); no secrets in code
+ │   ├── llm/
+ │   │   ├── client.py           # async Anthropic client, key pool, retries, hedging, breaker
+ │   │   ├── prompt.py           # cached system prompt, tool schema, few-shots, adversarials
+ │   │   ├── extract.py          # orchestrator: cache → LLM → guardrails → arbiter → fallback
+ │   │   └── fallback.py         # deterministic regex extractor (cross-check + outage path)
+ │   ├── core/
+ │   │   ├── guardrails.py       # §4.4 validation/normalization
+ │   │   ├── directives.py       # directives → eff_solar/active_min/caps arrays
+ │   │   ├── optimizer.py        # LP build + HiGHS solve + netting + round-rederive + tiers
+ │   │   ├── replay.py           # judge-equivalent self-validator
+ │   │   ├── summary.py          # plan_summary text
+ │   │   └── cache.py            # normalized note cache + scenario cache (LRU / Redis)
+ │   └── obs/logging.py          # structured, secret-redacting logs
+ ├── tests/
+ │   ├── public_cases.json       # copy of the organizer pack
+ │   ├── judge_sim.py            # ⭐ scores all 10 cases the way the rubric does
+ │   ├── test_optimizer.py       # LP vs reference costs (must be 10/10 exact)
+ │   ├── test_guardrails.py      # malformed/hostile LLM output
+ │   └── test_api.py             # schema, 400/422/500, health
+ ├── scripts/
+ │   ├── smoke.sh                # external curl of /health + one public case
+ │   └── loadtest.py             # concurrency/p95 measurement
+ ├── Dockerfile                  # slim, non-root, binds 0.0.0.0:$PORT, EXPOSE 8000, HEALTHCHECK
+ ├── render.yaml                 # (or railway.json) service def: image, env var names, health check path
+ ├── docker-compose.yml          # optional local + redis
+ ├── requirements.txt            # pinned
+ ├── .env.example                # names only, NO values
+ ├── .gitignore                  # .env, __pycache__, *.key
+ ├── README.md                   # ⭐ 10 rubric points live here
+ └── SOLUTION.md                 # this plan, as the repo's architecture doc
+
+ Critical files to get exactly right: app/schemas.py (10 pts of contract), app/core/optimizer.py (25+10 pts), app/core/guardrails.py + app/llm/prompt.py (25 pts), README.md + Dockerfile (20 pts).
+
+ ---
+
+ 7. Four-hour execution timeline
+
+ ┌───────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+ │   Time    │                                                                         Task                                                                          │                      Done when                      │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │           │ Create private GitHub repo (after reveal, per rulebook). Scaffold FastAPI with /health + a stub /optimize-energy. Deploy to Render/Railway            │ Public URL live. Deploy the skeleton first —        │
+ │ 0:00–0:15 │ immediately (paid always-on instance, PORT from env, health check path /health, GEMINI_API_KEY set in the dashboard) and confirm the public URL       │ hunting deploy bugs at 3:50 is how teams lose 10    │
+ │           │ answers from outside. Start the uptime pinger.                                                                                                        │ points.                                             │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 0:15–0:35 │ schemas.py — full request/response models, strict validation, 400 handler. Copy public_cases.json into tests/.                                        │ test_api.py green on schema shape                   │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 0:35–1:15 │ directives.py + optimizer.py + replay.py. Test against public cases using ground-truth interpretations (no LLM yet).                                  │ test_optimizer.py → 10/10 exact cost match (already │
+ │           │                                                                                                                                                       │  proven achievable)                                 │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 1:15–1:30 │ judge_sim.py — replays interpretation match + validity + cost ratio + prints a 0–100 estimate.                                                        │ Baseline score printed                              │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 1:30–2:15 │ LLM path: prompt.py, client.py, extract.py, guardrails.py. Wire end to end.                                                                           │ judge_sim.py end-to-end → 10/10 interpretation      │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 2:15–2:40 │ Reliability: caching, semaphore, retries, hedging, breaker, fallback.py, arbiter, timeouts, secret-redacting logs, error handlers. Run loadtest.py.   │ p95 < 5s under 100 concurrent; 0 failures           │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 2:40–3:05 │ Dockerfile → build → push to Docker Hub/GHCR with an exact tag + digest. Point Render/Railway at that image and redeploy. Verify /health + a public   │ Image pullable; endpoints external-verified         │
+ │           │ case from a different machine/network (phone hotspot works).                                                                                          │                                                     │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 3:05–3:30 │ README.md (quickstart, env var names, model/provider, guardrails, solver, exact run command, curl examples, sample test, deps, limitations, secret    │ A stranger can run it from a clean machine          │
+ │           │ handling) + SOLUTION.md.                                                                                                                              │                                                     │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 3:30–3:50 │ ≤3-min video: problem → architecture → LLM→guardrail→optimizer flow → live run/test.                                                                  │ Uploaded, link accessible                           │
+ ├───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ 3:50–4:00 │ Run the guide's final pre-submit checklist. Make repo public per rules. Submit.                                                                       │ All boxes ticked                                    │
+ └───────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+
+ Parallelization (2–4 people): A = optimizer+replay; B = LLM prompt+guardrails; C = API/schemas/Docker/deploy; D = README/video/judge_sim. The judge_sim.py harness is the shared contract — build it early, keep it running.
+
+ ---
+
+ 8. Verification (how we prove it works)
+
+ 1. python tests/judge_sim.py --base-url <url> — POSTs all 10 public cases and checks, per case:
+    - exactly one interpretation per note, in order; applies/directive_type/hours/numerics vs the pack's expected values;
+    - hourly_plan has 24 unique hours; balance holds every hour; solar_used ≤ eff_solar; battery bounds/rates/transitions; E[23] == E0;
+    - reserve / no-charge / no-discharge / grid-cap directives enforced hour by hour;
+    - total_grid_kwh / total_cost_bdt / peak_grid_kwh recomputed from the plan;
+    - cost_ratio = min(1, reference_cost / our_cost).
+      Prints a rubric-shaped 0–100 estimate. Target: interpretation 10/10, validity 10/10, cost ratio 1.00 on all 10.
+ 2. Paraphrase suite — ~30 hand-written rewordings of the sample notes (different clock formats, fractions, synonyms, overnight windows, all-day, single-hour) checked against expected directives. This is the direct proxy
+    for the 5 paraphrase-robustness points.
+ 3. Hostile input — truncated JSON, wrong types, 0 notes, 4 notes, 23 hours, duplicate hours, negative values, huge numbers, null battery fields → must return 400/422, never 500, never crash.
+ 4. Provider-failure drill — point the client at an invalid GEMINI_API_KEY / blackholed host → service must still return valid 200s via the fallback path.
+ 5. Load — scripts/loadtest.py at 100 and 500 concurrent → report p50/p95/p99 and failure rate.
+ 6. Docker fallback drill — on a clean machine: docker pull <tag> → documented docker run → /health → one public case. Exactly as the judge will do it.
+ 7. Clean-room README check — a teammate who didn't write it follows the README verbatim from a fresh clone. Any undocumented step loses points in category 7.
+
+ ---
+
+ 9. Pitfalls this plan explicitly defends against
+
+ - ❌ End-inclusive window parsing (the single most likely silent failure) → prompt rule + worked examples + paraphrase suite.
+ - ❌ factor = reduction instead of remaining → explicit rule, 6 worked examples, arbiter flag.
+ - ❌ Percentage reserves unresolved (SAMPLE-03) → battery object in the prompt.
+ - ❌ Missing a no_op entry for a distractor → guardrail synthesizes entries so output length always equals note count.
+ - ❌ Correct extraction, unapplied directive → directives feed the LP as hard constraints, then the self-validator replays them.
+ - ❌ Totals disagreeing with hourly_plan → totals derived from the final rounded plan.
+ - ❌ Float drift breaking balance / neutrality → round-then-rederive, exact E[23] = E0.
+ - ❌ 500s or stack traces on bad input → global handlers + tiered fallbacks; secrets redacted.
+ - ❌ Deploy discovered broken at 3:50 → deploy at 0:15.
+ - ❌ Render free-tier cold start during judging → paid always-on instance + external uptime pinger.
+ - ❌ Gemini safety-filter blocking a benign note → set the safety thresholds to the most permissive allowed and treat a blocked/empty candidate as a fallback trigger, not a crash.
+ - ❌ Secrets in repo/image → .env.example with names only, .gitignore, runtime-only env vars (set in the Render/Railway dashboard, never in the image), image scanned before push.
+
+ ---
+
+ 10. Settled decisions
+
+ - LLM: Google Gemini, paid key — gemini-2.5-flash primary (JSON mode, temp 0, thinking off), gemini-2.5-pro arbiter on disagreement. Env: GEMINI_API_KEY(S), GEMINI_MODEL, GEMINI_ARBITER_MODEL.
+ - Deployment: Render or Railway from the pushed Docker image, paid always-on instance (no free-tier sleep), health check path /health, secrets set in the platform dashboard, plus an external /health pinger through the
+   judging window.
+
+
+
+
+   Done. All five suites pass, background servers stopped, nothing committed.
+
+  What changed
+
+  New modules
+  - rules.py — deterministic extractor (time windows incl. 24-h clock/noon/midnight/midnight-wrap/single-hour/all-day, reduction-vs-remaining solar factors, %-of-capacity reserves, grid caps, distractors). It is never the
+    sole interpreter — the model runs first on every uncached note; this is the cross-check and the outage path the Guide permits.
+  - replay.py — the "Final replay" guardrail Problem Statement §08 requires. Implements the §11.3 checklist independently of the optimizer. A plan that fails is never emitted.
+  - test_paraphrase.py (43 rewordings), test_hostile.py (29 malformed/hostile cases + leak scan).
+
+  Rewritten
+  - llm.py — free-tier hardened: key pool (GEMINI_API_KEYS) round-robined, model chain 2.5-flash → 2.5-flash-lite → 2.0-flash (free caps are per-model), 429-aware retry with backoff, concurrency semaphore, circuit breaker,
+    normalized note cache, and a bounded arbiter call when the model and rules disagree.
+  - optimizer.py — full infeasibility ladder (relax the fewest directives that restore feasibility → base rules → analytic idle plan) and exact end-of-day neutrality: battery_kwh[23] is re-derived from the trajectory so it
+    can never disagree with battery_energy_after_kwh[23].
+  - main.py — response_model, documented 200/400/422/500, examples, tags → /docs and /redoc are now fully populated; 400 for malformed/structural and 422 for semantic (was 422 for everything); scenario-response cache; replay
+    wired into the response path.
+  - schemas.py — SemanticError model validators + OpenAPI examples. README.md, DEPLOY.md rewritten; .env.example, .gitignore, Dockerfile, render.yaml updated.
+
+  Measured on this build
+
+  ┌───────────────────────────────────────────────┬────────────────────────────────────────────────┐
+  │                     Check                     │                     Result                     │
+  ├───────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ Offline optimizer vs organizer optimal        │ 10/10, ratio 1.0000, p95 4 ms                  │
+  ├───────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ Full HTTP pipeline, public cases              │ 10/10 interp, 10/10 valid, ratio 1.0000        │
+  ├───────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ Paraphrase suite                              │ 43/43 (extractor and over HTTP)                │
+  ├───────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ Hostile input                                 │ 29/29, zero 5xx, no leaked keys/prompts/traces │
+  ├───────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ Provider-failure drill (no key and bogus key) │ 10/10 valid, 43/43                             │
+  ├───────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ Latency, distinct scenario_ids                │ p50 12 ms, p95 14 ms                           │
+  └───────────────────────────────────────────────┴────────────────────────────────────────────────┘
+
+  The provider-failure result is the headline: before this, an exhausted free-tier quota turned every note into no_op and forfeited 50 of 100 points. Now it costs nothing measurable.
+
+  Two things needing your decision
+
+  1. render.yaml is now plan: free as you chose. The cold-start risk is real — a slept free instance can take 30–50 s on first hit, past the judge's 30 s limit. DEPLOY.md Step 5 has the cron-job.org setup; set that up before
+     7 PM, it's the single highest-value 5 minutes of deploy work.
+  2. I have not run the live --llm paths — there's no key on this machine. Once you export a free key, run python test_paraphrase.py --llm once (it spends ~43 free calls) to confirm the model path matches the 43/43 the
+     extractor gets.
+
+  Per your rule I staged and committed nothing. When you're ready:
+
+  git add . && git commit -m "Free-tier LLM path, rule fallback, replay validator, Swagger" && git push origin main

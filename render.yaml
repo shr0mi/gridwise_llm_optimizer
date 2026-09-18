@@ -1,14 +1,32 @@
+# Render blueprint. Free plan: the instance sleeps after ~15 minutes idle and a
+# cold start can take 30-50s, which would blow the judge's 30s per-request limit.
+# Keep an external uptime pinger on /health for the whole judging window
+# (see DEPLOY.md, "Keep it warm"), or switch plan to `starter` for always-on.
 services:
   - type: web
     name: gridwise-llm
     runtime: docker
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
-    plan: starter
+    plan: free
+    autoDeploy: true
     envVars:
+      # Secrets are set in the Render dashboard, never in this file or the image.
       - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEYS
         sync: false
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
+      - key: GEMINI_FALLBACK_MODELS
+        value: gemini-2.5-flash-lite,gemini-2.0-flash
+      - key: LLM_MAX_CONCURRENCY
+        value: "4"
+      - key: LLM_TIMEOUT_S
+        value: "12"
+      - key: REQUEST_BUDGET_S
+        value: "25"
       - key: WEB_CONCURRENCY
         value: "2"
+      - key: LOG_LEVEL
+        value: "INFO"
