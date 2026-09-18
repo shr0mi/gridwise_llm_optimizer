@@ -37,11 +37,14 @@ class HourEntry(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     hour: int = Field(ge=0, le=23, description="Unique integer from 0 to 23.")
-    demand_kwh: float = Field(ge=0, description="Campus demand for this hour.")
+    demand_kwh: float = Field(ge=0, allow_inf_nan=False,
+                              description="Campus demand for this hour.")
     solar_kwh: float = Field(
-        ge=0, description="Base solar before operator-note adjustments.")
+        ge=0, allow_inf_nan=False,
+        description="Base solar before operator-note adjustments.")
     tariff_bdt_per_kwh: float = Field(
-        ge=0, description="Grid electricity price for this hour.")
+        ge=0, allow_inf_nan=False,
+        description="Grid electricity price for this hour.")
 
 
 class Battery(BaseModel):
@@ -49,11 +52,16 @@ class Battery(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    capacity_kwh: float = Field(gt=0, description="Maximum stored energy.")
-    initial_energy_kwh: float = Field(ge=0, description="Energy at the start of hour 0.")
-    minimum_energy_kwh: float = Field(ge=0, description="Base reserve floor.")
-    max_charge_kwh_per_hour: float = Field(ge=0, description="Hourly charge limit.")
-    max_discharge_kwh_per_hour: float = Field(ge=0, description="Hourly discharge limit.")
+    capacity_kwh: float = Field(gt=0, allow_inf_nan=False,
+                                description="Maximum stored energy.")
+    initial_energy_kwh: float = Field(ge=0, allow_inf_nan=False,
+                                      description="Energy at the start of hour 0.")
+    minimum_energy_kwh: float = Field(ge=0, allow_inf_nan=False,
+                                      description="Base reserve floor.")
+    max_charge_kwh_per_hour: float = Field(ge=0, allow_inf_nan=False,
+                                           description="Hourly charge limit.")
+    max_discharge_kwh_per_hour: float = Field(ge=0, allow_inf_nan=False,
+                                              description="Hourly discharge limit.")
 
     @model_validator(mode="after")
     def _coherent(self) -> "Battery":

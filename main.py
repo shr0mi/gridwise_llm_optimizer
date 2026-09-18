@@ -176,6 +176,38 @@ async def root() -> RedirectResponse:
     return RedirectResponse(url="/docs")
 
 
+@app.get("/diagnostics", include_in_schema=False)
+async def diagnostics() -> Dict[str, Any]:
+    """Operational visibility. Not part of the judged contract.
+
+    Exists because a fully degraded run is otherwise invisible: if the provider
+    is down, the deterministic parser quietly serves every note and the public
+    cases still score full marks. The Participant Guide disqualifies a
+    submission whose LLM is not in the operator-note interpretation path, so
+    "did the model actually run?" has to be answerable without grepping logs.
+
+    Returns provider and model identifiers only -- never a credential.
+    """
+    stats = dict(llm.STATS)
+    interpreted = (stats["interpreted_by_llm"] + stats["interpreted_by_cache"]
+                   + stats["interpreted_by_fallback"])
+    degraded = stats["interpreted_by_fallback"] > 0 or (
+        interpreted > 0 and stats["interpreted_by_llm"] == 0
+        and stats["interpreted_by_cache"] == 0)
+    return {
+        "provider": llm.PROVIDER.name,
+        "model_chain": llm.MODEL_CHAIN,
+        "keys_configured": len(llm._api_keys()),
+        "llm_available": llm.llm_available(),
+        "breaker_open": llm._breaker.open,
+        "models_cooling_down": llm.cooldowns(),
+        "degraded": degraded,
+        **stats,
+        "cache": llm.cache_stats(),
+        "scenario_cache_entries": len(_scenario_cache),
+    }
+
+
 @app.get(
     "/health",
     tags=["health"],
@@ -268,6 +300,8 @@ async def optimize_energy(payload: ScenarioRequest) -> JSONResponse:
                     "deterministic reading")
         import rules
         directives = llm.sanitize(rules.extract(notes, battery), notes, battery)
+        llm.STATS["interpreted_by_fallback"] += 1
+        llm.STATS["last_llm_error"] = "interpretation exceeded the request budget"
 
     # 2. optimization -- off the event loop; HiGHS releases the GIL
     loop = asyncio.get_running_loop()

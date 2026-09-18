@@ -43,6 +43,28 @@ def _mutate(**changes: Any) -> Dict[str, Any]:
     return body
 
 
+def _inf_body(field: str, value: str = "Infinity") -> bytes:
+    """A valid request with one non-finite hour value, as raw JSON."""
+    body = valid_body()
+    body["hours"][3][field] = 0
+    raw = json.dumps(body)
+    marker = f'"{field}": 0'
+    if marker not in raw:
+        marker = f'"{field}":0'
+    return raw.replace(marker, f'"{field}": {value}', 1).encode()
+
+
+def _inf_battery(field: str, value: str = "Infinity") -> bytes:
+    """A valid request with one non-finite battery value, as raw JSON."""
+    body = valid_body()
+    body["battery"][field] = 0
+    raw = json.dumps(body)
+    marker = f'"{field}": 0'
+    if marker not in raw:
+        marker = f'"{field}":0'
+    return raw.replace(marker, f'"{field}": {value}', 1).encode()
+
+
 # (name, raw body bytes, accepted status codes)
 CASES: List[Tuple[str, bytes, Tuple[int, ...]]] = [
     ("truncated JSON", b'{"scenario_id": "X", "operator_notes": [', (400,)),
@@ -85,6 +107,18 @@ CASES: List[Tuple[str, bytes, Tuple[int, ...]]] = [
     ("battery field missing",
      json.dumps(_mutate(battery={k: v for k, v in BATTERY.items()
                                  if k != "max_charge_kwh_per_hour"})).encode(), (400,)),
+    # Non-finite floats. Pydantic accepts inf unless told otherwise, and
+    # +Infinity passes a `ge=0` check, so these reached the solver: demand and
+    # tariff crashed it (500), and infinite SOLAR was worse -- a 200 with a plan
+    # that drew free energy at midnight and undercut the true optimum.
+    ("Infinity demand", _inf_body("demand_kwh"), (400,)),
+    ("Infinity solar", _inf_body("solar_kwh"), (400,)),
+    ("Infinity tariff", _inf_body("tariff_bdt_per_kwh"), (400,)),
+    ("-Infinity demand", _inf_body("demand_kwh", "-Infinity"), (400,)),
+    ("Infinity capacity", _inf_battery("capacity_kwh"), (400,)),
+    ("Infinity initial energy", _inf_battery("initial_energy_kwh"), (400,)),
+    ("Infinity max charge", _inf_battery("max_charge_kwh_per_hour"), (400,)),
+
     ("NaN demand", b'{"scenario_id":"X","operator_notes":["n"],"hours":[{"hour":0,'
                    b'"demand_kwh":NaN,"solar_kwh":0,"tariff_bdt_per_kwh":1}],'
                    b'"battery":' + json.dumps(BATTERY).encode() + b"}", (400, 422)),

@@ -485,3 +485,239 @@ Ready to code?
   Per your rule I staged and committed nothing. When you're ready:
 
   git add . && git commit -m "Free-tier LLM path, rule fallback, replay validator, Swagger" && git push origin main
+
+
+
+
+   Ready to code?
+
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ test.json — exhaustive self-scoring test pack for GridWise LLM
+
+ Context
+
+ The service is built and live-verified (10/10 on the organizer's public pack against your real Gemini key). But 10 public cases is a thin sample: the hidden judge set paraphrases the same directives, varies
+ demand/solar/tariff/battery, and combines directives in ways the public pack never shows. You want one file you can run against your key that proves the whole thing holds up.
+
+ This plan builds test.json — a self-contained pack of ~100 cases, each carrying its input and its expected output — plus a runner that scores the service against it the way the judge will.
+
+ What the docs actually let us assert
+
+ Re-reading all three organizer files settles what "expected output" can mean:
+
+ - directive_interpretation is exactly checkable. The Guide's "Directive accuracy" metric says applies, directive_type, hours and numeric values must match ground truth within tolerance. Free-text explanation is explicitly
+   not matched byte-for-byte.
+ - total_cost_bdt is exactly checkable. Optimization score is min(1, organizer_optimal / our_cost).
+ - hourly_plan is NOT checkable by equality. The pack's own equivalence_note says: "Another schedule may also be accepted if it satisfies the same directive ground truth and all GridWise constraints and achieves equivalent
+   optimal cost." total_grid_kwh and peak_grid_kwh can legitimately differ between equal-cost optima.
+
+ So each case asserts: exact interpretation + exact optimal cost + full replay validity, and ships a reference plan for information only. Tolerance 0.01 (Problem Statement 11.5).
+
+ A real bug this planning surfaced
+
+ Probing corner cases found one. With a contradictory directive (max_grid_kwh = 0 in an hour that has no solar and insufficient discharge headroom):
+
+ tier=base  cost=25480.0  replay=h2: grid 150.0 exceeds max_grid_kwh 0.0
+
+ optimizer.optimize correctly relaxes to the base tier, but main.py then replays that plan against the full directive list, which of course fails — so it discards a good cheap plan and falls all the way to the idle-battery
+ plan. It should replay against the directives the optimizer actually kept. Unscored situation (organizer scoring scenarios are guaranteed feasible), but it needlessly throws away partial credit on the GridWise consistency
+ checks. Fixing it is part of this work.
+
+ ---
+
+ Deliverables
+
+ ┌───────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+ │         File          │                                  Role                                   │
+ ├───────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ test.json             │ The pack: ~100 cases, inputs + expected outputs + per-case expectations │
+ ├───────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ make_test_cases.py    │ Generator — authors scenarios, computes optimal costs, self-verifies    │
+ ├───────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ test_suite.py         │ Runner — scores a live service against test.json                        │
+ ├───────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ optimizer.py, main.py │ The kept-directives replay fix above                                    │
+ └───────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+
+ ---
+
+ 1. test.json structure
+
+ One flat cases array so the runner stays simple; each case declares its own expectations.
+
+ {
+   "_meta": {
+     "title": "GridWise LLM — exhaustive local test pack",
+     "version": "1.0",
+     "generated_from": "Problem Statement §04-11 + Participant Guide §07-10",
+     "tolerance_kwh": 0.01, "tolerance_bdt": 0.01,
+     "case_count": 102,
+     "how_to_use": ["python test_suite.py --base-url http://localhost:8000", "..."],
+     "note": "Reference plans are ONE valid optimum. Equivalent optima are accepted."
+   },
+   "cases": [
+     {
+       "id": "GW-TIME-08",
+       "category": "time_expression",
+       "difficulty": "edge",
+       "traps": ["midnight wrap", "ascending order"],
+       "description": "Overnight no-charge window crossing midnight.",
+       "input": { "scenario_id": "...", "operator_notes": [...], "hours": [24], "battery": {...} },
+       "expected_output": {
+         "directive_interpretation": [ { "note_index": 0, "applies": true,
+           "directive_type": "no_charge_window",
+           "structured_adjustment": { "hours": [0, 1, 22, 23] },
+           "explanation": "<informational, not matched>" } ],
+         "total_cost_bdt": 31840.0,
+         "reference_hourly_plan": [24],
+         "total_grid_kwh": 2880.0, "peak_grid_kwh": 175.0
+       },
+       "expectations": { "http_status": 200, "match_interpretation": true,
+                         "match_cost": true, "must_replay_clean": true }
+     }
+   ]
+ }
+
+ Invalid-request cases carry raw_body (a literal string, so truncated JSON is expressible) instead of input, and expectations.http_status: [400].
+
+ ---
+
+ 2. Case inventory (~102)
+
+ Scenario shapes copied from the sample pack's real ranges — capacity 200–260, initial ≈ half, base min 30–40, rates 50–65, demand 80–230, solar peak 110–260, tariff 4–34 with an evening spike — so costs stay realistic.
+
+ A · Directive coverage — core (12). Two straightforward cases per directive type, including two distinct no_op distractors.
+
+ B · Time expressions — the #1 trap (16). 1 PM to 3 PM→[13,14] · 13:00 to 15:00 · 01:00 to 04:00→[1,2,3] (colon = 24-hour clock, not 1 PM) · from one until three · noon until 2 PM · 10 AM until noon · between 11 AM and 2
+ PM→[11,12,13] · 10 PM until 2 AM→[0,1,22,23] (wraps, still ascending) · until midnight→ last hour 23 · from midnight until 4 AM · during the 7 PM hour→[19] · throughout the day→0–23 · through 9 PM · 1-3 PM (hyphen, no
+ spaces) · from 6 PM onwards · between 18:00 and 21:00.
+
+ C · Numeric interpretation (12). 80% reduction→0.2 · drop to 25%→0.25 · about half→0.5 · one-fifth→0.2 · cut by two-thirds→0.33 · derated by 75 percent→0.25 · panels offline→0.0 · reserve 50% of capacity→absolute kWh ·
+ reserve a quarter of the pack · reserve at least 120 kWh · grid cap must not exceed 155 / at or below 190 / limit is 180.
+
+ D · Distractors → no_op (8). Plain campus life, plus the hard ones: "evaluating new solar panels next quarter" (energy vocabulary, wrong timeframe), "the 3 PM seminar moved to room B" (contains a time, no energy effect),
+ "the electricity bill was paid yesterday" (energy vocabulary, no schedule effect).
+
+ E · Multi-note combinations (10). 2- and 3-note mixes; 3 notes where all are distractors; and same-type composition: two overlapping solar_reductions (factors multiply), two overlapping reserves (max wins), two overlapping
+ grid caps (min wins), no_charge + no_discharge on the same hours.
+
+ F · Scenario corner cases (12). Flat tariff (no arbitrage) · extreme evening spike · zero solar all day · solar exceeding demand (forces curtailment) · zero-demand hours · battery frozen (max_charge = max_discharge = 0) ·
+ initial == capacity · initial == minimum · reserve == capacity · factor = 1.0 · grid cap exactly at the binding value · very large magnitudes. (All seven of these I probed already solve cleanly at tier=optimal with a clean
+ replay — they are legitimate scored cases, not robustness ones.)
+
+ G · Robustness / contradictory (6). Asserts 200 + a plan valid under base GridWise rules, with match_cost: false — these are deliberately unsatisfiable, and the Problem Statement guarantees the judge's scored set contains
+ no such case. Grid cap 0 with no solar · reserve unreachable because charging is banned · no_discharge all day plus a reserve above initial · absurdly low all-day grid cap · reserve stated above capacity (asserts the
+ guardrail clamps to capacity) · factor stated as 150 % (asserts the clamp to 1.0).
+
+ H · Invalid requests (26). Ported from the existing test_hostile.py catalogue, which already passes 29/29: malformed/truncated JSON, missing fields, 0 and 4 notes, 23/25 hours, duplicate hour, out-of-range hour, negatives,
+ NaN, wrong types, null battery → 400; contradictory battery numbers → 422; huge-but-valid, all-zero, unknown extra fields → 200.
+
+ ---
+
+ 3. make_test_cases.py — generator with self-verification
+
+ Expected costs must not simply inherit a bug from the solver that produces them. For every case the generator:
+
+ 1. Builds the scenario and hand-authored ground-truth directives (never machine-extracted — that would test the extractor against itself).
+ 2. Solves with optimizer.optimize(...) (already exact on 10/10 public cases).
+ 3. Cross-checks with an independently written LP — different variable layout, method="highs-ipm" instead of the default dual simplex — and asserts the objective matches within 1e-6. A formulation bug would have to be
+    reproduced twice, differently, to slip through.
+ 4. Validates the reference plan with replay.validate(...) against its own ground truth; refuses to emit a case whose reference plan is invalid.
+ 5. Asserts every authored interpretation satisfies the §08 guardrail table (ascending unique hours 0–23, factor ∈ [0,1], reserve ≤ capacity, applies semantics).
+ 6. Re-verifies the 10 public cases end to end as a regression gate before writing anything.
+
+ Run once to produce test.json; it is committed as data, so the suite needs no regeneration to run.
+
+ ---
+
+ 4. test_suite.py — the runner
+
+ python test_suite.py --base-url http://localhost:8000          # everything
+ python test_suite.py --base-url ... --category time_expression # one slice
+ python test_suite.py --base-url ... --delay 3 --limit 20       # free-tier friendly
+
+ Per case it checks interpretation (exact on applies/directive_type/hours/numerics, ignoring explanation), replays the returned plan against ground truth with replay.validate, compares cost, and recomputes the three totals
+ from hourly_plan. Output is a per-category table plus a rubric-shaped estimate.
+
+ Free-tier pacing matters here. Your key is capped at 20 requests/minute, and ~76 scored cases is far more than one minute of quota. The runner therefore defaults to --delay 3, reports how many cases were answered by the
+ LLM versus the deterministic fallback, and supports --category/--limit so you can test a slice without burning the quota. A full unpaced run would mostly measure your rate limit, not your service.
+
+ To make that LLM-vs-fallback split visible, main.py gains an X-GridWise-Path: llm|cache|rules response header. A header is not a body key, so the "exactly 7 top-level keys" response contract is untouched.
+
+ ---
+
+ 5. The optimizer/replay fix
+
+ optimizer.optimize will return the directives it actually kept alongside the plan. main.py replays against those rather than the full list, so a relaxed-but-valid cheap plan is emitted instead of being discarded for the
+ idle fallback. The existing three-tier ladder and the final safe-plan guarantee stay exactly as they are.
+
+ ---
+
+ Verification
+
+ python make_test_cases.py                      # regenerates + self-verifies test.json
+ python test_local.py --offline                 # regression: 10/10, ratio 1.0000
+ python test_paraphrase.py                      # regression: 43/43
+ python test_suite.py --base-url http://localhost:8000 --category invalid_request
+ python test_suite.py --base-url http://localhost:8000 --delay 3
+
+ Done when:
+ - make_test_cases.py emits all ~102 cases with both LP formulations agreeing and every reference plan replay-clean;
+ - the service passes 100 % of categories A–F on interpretation, validity and cost with the key set;
+ - category G returns 200 with base-rules-valid plans;
+ - category H matches the documented 400/422/200 codes with zero 5xx;
+ - test_local.py --offline and test_paraphrase.py still pass, proving no regression.
+
+ Any category-A–F failure is a genuine gap to fix in rules.py or the prompt in llm.py — that is the point of the pack.
+
+ Standing constraint: no git commit or git push at any point.
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+
+
+test.json is written — 105 cases, 868 KB, at the repo root.
+
+  What's in it
+
+  ┌─────────────────┬───────┬────────────────────────────────────────────────────────────┐
+  │    Category     │ Cases │                           Covers                           │
+  ├─────────────────┼───────┼────────────────────────────────────────────────────────────┤
+  │ directive_core  │    12 │ Two clean cases per directive type, incl. two no_ops       │
+  ├─────────────────┼───────┼────────────────────────────────────────────────────────────┤
+  │ time_expression │    16 │ The #1 trap — end-exclusive windows                        │
+  ├─────────────────┼───────┼────────────────────────────────────────────────────────────┤
+  │ numeric         │    12 │ factor = fraction remaining, % of capacity, fraction words │
+  ├─────────────────┼───────┼────────────────────────────────────────────────────────────┤
+  │ distractor      │     8 │ no_op, including energy-flavoured traps                    │
+  ├─────────────────┼───────┼────────────────────────────────────────────────────────────┤
+  │ multi_note      │    10 │ 2–3 note mixes + same-type composition                     │
+  ├─────────────────┼───────┼────────────────────────────────────────────────────────────┤
+  │ scenario_corner │    12 │ Flat tariff, spike, no solar, curtailment, frozen battery… │
+  ├─────────────────┼───────┼────────────────────────────────────────────────────────────┤
+  │ robustness      │     6 │ Contradictory directives — must still answer 200           │
+  ├─────────────────┼───────┼────────────────────────────────────────────────────────────┤
+  │ invalid_request │    29 │ 400 / 422 / 200, with raw bodies                           │
+  └─────────────────┴───────┴────────────────────────────────────────────────────────────┘
+
+  Nastiest ones: 01:00 to 04:00 → [1,2,3] (colon means 24-hour clock, not 1 PM) · 10 PM until 2 AM → [0,1,22,23] (wraps, still ascending) · until midnight → last hour 23 · two overlapping solar_reductions where factors
+  multiply on the shared hour · overlapping reserves where max wins, overlapping caps where min wins.
+
+  Each case carries its own expected output
+
+  directive_interpretation (exact — note_index, applies, directive_type, hours, numerics; explanation is explicitly not compared), total_cost_bdt, total_grid_kwh, peak_grid_kwh, and a reference_hourly_plan. Per the organizer
+  pack's own equivalence_note, the plan is one valid optimum — a different schedule passes if it hits the same cost and obeys the same directives, so don't diff it byte-for-byte.
+
+  Every asserted cost is double-solved. Once by the HiGHS dual simplex, then independently by a second LP with a different variable layout under the interior-point method; all 70 scored cases agree to <0.02 BDT. Every
+  reference plan also passes a full judge-equivalent replay, and I re-verified all of that against the written file: 70 scored / 6 robustness / 29 invalid, all reference plans clean, all structural invariants OK.
+
+  Two things you should know
+
+  1. A real finding, not yet fixed. I first wrote GW-CORE-09 with a grid cap of 155 kWh where hour 19 needs exactly 155 — and it came back infeasible. Cause: optimizer.py solves with grid_cap − 1e-5 (CAP_MARGIN) so rounding
+  can't breach the cap. That margin makes an exactly-binding max_grid_window unsatisfiable, and the case would drop to a relaxed tier and lose its directive-application credit. If a hidden case has a cap that binds exactly,
+  you'd lose it. I moved the test case off the knife-edge (cap 165) rather than touch the optimizer, since you asked for test.json only — but this is worth fixing.
+
+  2. Pacing. 70 scored cases is far past your free key's 20 requests/minute. Run a category at a time or space the calls, otherwise you'll be measuring your rate limit rather than your service. _meta.free_tier_note says the
+  same in the file.
+
+  There's no runner yet — you asked for the file only. Say the word and I'll write one, or fix the CAP_MARGIN issue.

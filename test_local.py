@@ -245,7 +245,60 @@ def main() -> int:
     print(f"rubric estimate: interpretation 25pt -> {25 * interp_ok / n:.1f}, "
           f"application 25pt -> {25 * valid_ok / n:.1f}, "
           f"optimization 10pt -> {10 * avg_ratio:.1f}")
-    return 0 if (valid_ok == n and interp_ok == n) else 1
+
+    degraded = False
+    if not args.offline:
+        degraded = report_llm_path(args.base_url)
+
+    scores_clean = valid_ok == n and interp_ok == n
+    return 0 if (scores_clean and not degraded) else 1
+
+
+def report_llm_path(base_url: str) -> bool:
+    """Warn loudly when the deterministic parser served the run. True = degraded.
+
+    A perfect score proves nothing if the model never ran: the Participant Guide
+    treats an LLM absent from the operator-note interpretation path as failing
+    the mandatory requirement, "not eligible for the final preliminary
+    shortlist". This has to be impossible to miss.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+                base_url.rstrip("/") + "/diagnostics", timeout=10) as r:
+            diag = json.loads(r.read())
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n[!] could not read /diagnostics ({exc}); LLM path unverified")
+        return False
+
+    by_llm = diag.get("interpreted_by_llm", 0)
+    by_cache = diag.get("interpreted_by_cache", 0)
+    by_fallback = diag.get("interpreted_by_fallback", 0)
+    print(f"\ninterpretation path: llm={by_llm} cache={by_cache} "
+          f"fallback={by_fallback}   provider={diag.get('provider')} "
+          f"model={diag.get('last_model_used')}")
+
+    if by_fallback == 0 and by_llm > 0:
+        print("LLM path verified: the model produced these interpretations.")
+        return False
+
+    bar = "!" * 74
+    print(f"\n{bar}")
+    if by_fallback:
+        print(f"!!  WARNING: the deterministic parser served {by_fallback} of "
+              f"{by_fallback + by_llm + by_cache} request(s).")
+    else:
+        print("!!  WARNING: no request in this run reached the language model.")
+    print(f"!!  Last LLM error: {diag.get('last_llm_error')}")
+    print(f"!!  Provider: {diag.get('provider')}  "
+          f"keys_configured={diag.get('keys_configured')}  "
+          f"breaker_open={diag.get('breaker_open')}")
+    print("!!  This score does NOT demonstrate a working LLM path, and the")
+    print("!!  rubric REQUIRES the LLM to be in the interpretation path.")
+    print("!!  Fix the provider before submitting.")
+    print(f"{bar}")
+    return True
 
 
 if __name__ == "__main__":

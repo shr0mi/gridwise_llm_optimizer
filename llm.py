@@ -33,6 +33,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import config  # noqa: F401  -- loads .env before the settings below are read
+import providers
 import rules
 
 log = logging.getLogger("gridwise.llm")
@@ -68,28 +69,50 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-# Free-tier rate and daily caps are per model, so keep alternates ready. These
-# were probed against a live free-tier key: gemini-2.5-flash-lite, gemini-2.0-flash
-# and gemini-2.5-pro all return 404 for new keys, so they are NOT in the chain.
-FALLBACK_MODELS = [m.strip() for m in os.getenv(
-    "GEMINI_FALLBACK_MODELS",
-    "gemini-flash-latest,gemini-3.5-flash,gemini-3.1-flash-lite").split(",")
-    if m.strip()]
+#: Which provider drives interpretation. All the resilience machinery below --
+#: key pool, breaker, model chain, cache, cross-check, arbiter -- applies to
+#: whichever one is selected, so switching is a single environment variable.
+PROVIDER_NAME = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+PROVIDER = providers.get_provider(PROVIDER_NAME)
+
+# Model names are read from the provider-specific variables first so an existing
+# GEMINI_MODEL keeps working, then fall back to the provider's own defaults.
+MODEL = (os.getenv("LLM_MODEL") or os.getenv("GEMINI_MODEL")
+         or PROVIDER.default_model)
+_raw_fallbacks = (os.getenv("LLM_FALLBACK_MODELS")
+                  or os.getenv("GEMINI_FALLBACK_MODELS") or "")
+FALLBACK_MODELS = ([m.strip() for m in _raw_fallbacks.split(",") if m.strip()]
+                   or list(PROVIDER.default_fallbacks))
 MODEL_CHAIN: List[str] = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
 
-TIMEOUT_S = _env_float("LLM_TIMEOUT_S", 6.0)
+TIMEOUT_S = _env_float("LLM_TIMEOUT_S", 8.0)
 # One attempt per model in the chain, so a rate-limited primary walks all of it.
 MAX_ATTEMPTS = _env_int("LLM_MAX_ATTEMPTS", max(3, len(FALLBACK_MODELS) + 1))
 # Whole-interpretation ceiling. Walking the model chain must finish inside this,
 # otherwise the outer request budget kills it and the latency score suffers even
 # though the deterministic reading would have answered in milliseconds.
-TOTAL_BUDGET_S = _env_float("LLM_TOTAL_BUDGET_S", 7.0)
+TOTAL_BUDGET_S = _env_float("LLM_TOTAL_BUDGET_S", 12.0)
 MAX_CONCURRENCY = _env_int("LLM_MAX_CONCURRENCY", 4)     # free tier is ~10-15 RPM
 CACHE_SIZE = _env_int("LLM_CACHE_SIZE", 20000)
 ARBITER_ENABLED = os.getenv("LLM_ARBITER", "1").strip().lower() not in ("0", "false", "no")
 BREAKER_THRESHOLD = _env_int("LLM_BREAKER_THRESHOLD", 4)
 BREAKER_COOLDOWN_S = _env_float("LLM_BREAKER_COOLDOWN_S", 30.0)
+
+#: Operational counters. Without these a fully degraded run -- every note served
+#: by the deterministic parser because the provider is down -- looks identical to
+#: a healthy one, and the rubric disqualifies a submission whose LLM is not in
+#: the interpretation path. `/diagnostics` surfaces them.
+STATS: Dict[str, Any] = {
+    "requests": 0,
+    "interpreted_by_llm": 0,
+    "interpreted_by_cache": 0,
+    "interpreted_by_fallback": 0,
+    "model_calls_ok": 0,
+    "model_calls_failed": 0,
+    "arbiter_calls": 0,
+    "last_llm_error": None,
+    "last_model_used": None,
+}
 
 _SEMAPHORE: Optional[asyncio.Semaphore] = None
 
@@ -113,33 +136,20 @@ def _api_keys() -> List[str]:
     global _keys
     if _keys is not None:
         return _keys
-    raw = (os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
-           or os.getenv("GOOGLE_API_KEY") or "")
+    raw = ""
+    for env_name in PROVIDER.key_envs:
+        raw = os.getenv(env_name) or ""
+        if raw:
+            break
     _keys = [k.strip() for k in raw.split(",") if k.strip()]
     if not _keys:
-        log.warning("no Gemini API key configured - interpretation will use the "
-                    "deterministic fallback path")
+        log.warning("no %s API key configured (%s) - interpretation will use "
+                    "the deterministic fallback path",
+                    PROVIDER.name, "/".join(PROVIDER.key_envs))
     return _keys
 
 
-def _client_for(key: str):
-    global _import_failed
-    if key in _clients:
-        return _clients[key]
-    if _import_failed:
-        return None
-    try:
-        from google import genai
-        client = genai.Client(api_key=key)
-    except Exception:  # noqa: BLE001
-        log.error("could not construct the Gemini client")
-        _import_failed = True
-        return None
-    _clients[key] = client
-    return client
-
-
-def _next_client() -> Optional[Any]:
+def _next_key() -> Optional[str]:
     """Round-robin the key pool so one free-tier quota is not the ceiling."""
     global _key_cursor
     keys = _api_keys()
@@ -147,7 +157,7 @@ def _next_client() -> Optional[Any]:
         return None
     key = keys[_key_cursor % len(keys)]
     _key_cursor += 1
-    return _client_for(key)
+    return key
 
 
 def llm_available() -> bool:
@@ -163,6 +173,13 @@ def reset_for_tests() -> None:
     _import_failed = False
     _cache.clear()
     _breaker.record_success()
+    providers.reset()
+    for field in ("requests", "interpreted_by_llm", "interpreted_by_cache",
+                  "interpreted_by_fallback", "model_calls_ok",
+                  "model_calls_failed", "arbiter_calls"):
+        STATS[field] = 0
+    STATS["last_llm_error"] = None
+    STATS["last_model_used"] = None
 
 
 # ---------------------------------------------------------------- circuit breaker
@@ -482,75 +499,79 @@ def cache_stats() -> Dict[str, int]:
 _QUOTA_MARKERS = ("429", "resource_exhausted", "resource exhausted", "quota",
                   "rate limit", "ratelimit", "too many requests")
 
+#: Statuses that will never succeed on retry. Retrying them only burns the
+#: interpretation budget and delays the deterministic fallback.
+_PERMANENT_MARKERS = ("401", "403", "404", "unauthenticated", "permission_denied",
+                      "permission denied", "not_found", "not found", "denied access",
+                      "api key not valid", "invalid api key", "authentication")
+
 
 def _is_quota_error(exc: BaseException) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return any(m in text for m in _QUOTA_MARKERS)
 
 
+def _is_permanent_error(exc: BaseException) -> bool:
+    """A dead key, a revoked project or a missing model. Stop immediately."""
+    text = f"{type(exc).__name__} {exc}".lower()
+    if any(m in text for m in _QUOTA_MARKERS):
+        return False
+    return any(m in text for m in _PERMANENT_MARKERS)
+
+
 def _rejects_thinking(exc: BaseException) -> bool:
-    """400 INVALID_ARGUMENT -- usually an unsupported thinking_config field."""
+    """400 INVALID_ARGUMENT -- usually an unsupported thinking-budget field."""
     text = str(exc).lower()
-    return "invalid_argument" in text or "400" in text
+    return "invalid_argument" in text or "invalid argument" in text
 
 
-def _parse_payload(text: str) -> Any:
-    """Defensive JSON parse -- structured output should not need the fallbacks."""
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        text = text.split("\n", 1)[1] if "\n" in text else text
-    if not text:
-        return None
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(text[start:end + 1])
-        except json.JSONDecodeError:
-            return None
-    if isinstance(data, dict):
-        return data.get("interpretations", data.get("choices"))
-    return data
-
-
-#: Models observed to reject ``thinking_config`` with 400 INVALID_ARGUMENT. Filled
-#: in at runtime the first time a model refuses it, so the retry succeeds and every
-#: later call to that model skips the field. Gemini 3.x lite variants need this.
+#: Models observed to reject a thinking budget with 400 INVALID_ARGUMENT. Filled
+#: in at runtime the first time a model refuses it, so the retry succeeds and
+#: every later call to that model skips the field.
 _NO_THINKING: set = set()
 
 
-async def _generate(model: str, client: Any, prompt: str,
-                    schema: Dict[str, Any], system: str) -> Any:
-    from google.genai import types
+def _record_error(exc: BaseException, model: str) -> None:
+    STATS["model_calls_failed"] += 1
+    STATS["last_llm_error"] = f"{type(exc).__name__} on {model}: {str(exc)[:160]}"
 
-    config = types.GenerateContentConfig(
-        system_instruction=system,
-        temperature=0.0,
-        response_mime_type="application/json",
-        response_schema=schema,
-        safety_settings=[
-            types.SafetySetting(category=c, threshold="BLOCK_NONE")
-            for c in ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
-                      "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                      "HARM_CATEGORY_DANGEROUS_CONTENT")
-        ],
-    )
-    # Thinking off on the extraction call: it costs seconds of latency and
-    # free-tier tokens for a task that does not need it. Some models reject the
-    # field outright -- those are remembered in _NO_THINKING and skipped.
-    if model not in _NO_THINKING:
-        try:
-            config.thinking_config = types.ThinkingConfig(thinking_budget=0)
-        except Exception:  # noqa: BLE001
-            pass
 
-    resp = await client.aio.models.generate_content(
-        model=model, contents=prompt, config=config)
-    return _parse_payload(getattr(resp, "text", "") or "")
+#: model -> monotonic time it becomes usable again.
+_MODEL_COOLDOWN: Dict[str, float] = {}
+_RETRY_AFTER_RE = re.compile(r"retry in ([0-9.]+)s", re.IGNORECASE)
+DEFAULT_COOLDOWN_S = _env_float("LLM_MODEL_COOLDOWN_S", 60.0)
+
+
+def _cool_down(model: str, exc: BaseException) -> None:
+    """Park a rate-limited model instead of rediscovering its 429 every request.
+
+    The free tier caps requests per minute *per model*, and the 429 body carries
+    the delay ("Please retry in 25.8s"). Without this the chain burns two or
+    three seconds re-confirming the same limit on every single request, which is
+    latency spent to learn nothing.
+    """
+    match = _RETRY_AFTER_RE.search(str(exc))
+    delay = float(match.group(1)) if match else DEFAULT_COOLDOWN_S
+    delay = max(1.0, min(delay, 300.0))
+    _MODEL_COOLDOWN[model] = time.monotonic() + delay
+    log.info("parking %s for %.0fs after a rate limit", model, delay)
+
+
+def _usable_models() -> List[str]:
+    """The chain minus models still cooling off, in preference order."""
+    now = time.monotonic()
+    ready = [m for m in MODEL_CHAIN if _MODEL_COOLDOWN.get(m, 0.0) <= now]
+    if ready:
+        return ready
+    # Everything is cooling. Probe only the one closest to being usable -- a
+    # stale cooldown must never black out the model path, but walking the whole
+    # chain to collect four more 429s just burns the budget.
+    return [min(MODEL_CHAIN, key=lambda m: _MODEL_COOLDOWN.get(m, 0.0))]
+
+
+def cooldowns() -> Dict[str, int]:
+    now = time.monotonic()
+    return {m: int(t - now) for m, t in _MODEL_COOLDOWN.items() if t > now}
 
 
 async def _call_model(prompt: str, schema: Dict[str, Any] = RESPONSE_SCHEMA,
@@ -562,57 +583,94 @@ async def _call_model(prompt: str, schema: Dict[str, Any] = RESPONSE_SCHEMA,
     clipped to the time left, so the chain gives up in time for the caller to
     fall back gracefully instead of being cut off mid-flight.
     """
-    if not llm_available() or _breaker.open:
+    if not llm_available():
+        STATS["last_llm_error"] = "no API key configured"
+        return None
+    if _breaker.open:
+        STATS["last_llm_error"] = "circuit breaker open"
         return None
     if deadline is None:
         deadline = time.monotonic() + TOTAL_BUDGET_S
 
-    attempts = max(1, MAX_ATTEMPTS)
+    chain = _usable_models()
+    attempts = max(1, min(MAX_ATTEMPTS, len(chain)))
     last_exc: Optional[BaseException] = None
+    # A rate limit is a property of one model's quota, not of the provider, and
+    # the per-model cooldown already handles it. Only a genuine provider problem
+    # should trip the breaker -- otherwise a busy minute blacks out the LLM path
+    # for everyone, which is exactly the failure this whole module exists to avoid.
+    saw_provider_failure = False
     for attempt in range(attempts):
         remaining = deadline - time.monotonic()
         if remaining < 0.5:
             log.warning("interpretation budget exhausted after %d attempt(s)", attempt)
             break
-        model = MODEL_CHAIN[min(attempt, len(MODEL_CHAIN) - 1)]
-        client = _next_client()
-        if client is None:
+        model = chain[min(attempt, len(chain) - 1)]
+        key = _next_key()
+        if key is None:
             return None
         try:
             async with _semaphore():
                 payload = await asyncio.wait_for(
-                    _generate(model, client, prompt, schema, system),
+                    PROVIDER.generate(model, key, prompt, schema, system,
+                                      _NO_THINKING),
                     min(TIMEOUT_S, remaining))
             if payload is not None:
                 _breaker.record_success()
+                STATS["model_calls_ok"] += 1
+                STATS["last_model_used"] = model
                 return payload
             last_exc = ValueError("empty model response")
+            _record_error(last_exc, model)
         except asyncio.TimeoutError as exc:
             last_exc = exc
+            saw_provider_failure = True
+            _record_error(exc, model)
             log.warning("model call timed out after %ss (model=%s)", TIMEOUT_S, model)
+        except providers.ProviderUnavailable as exc:
+            # The SDK is missing or a client cannot be built. Nothing downstream
+            # will fix that, so stop the whole chain now.
+            _record_error(exc, model)
+            log.error("provider %s unavailable: %s", PROVIDER.name, exc)
+            _breaker.record_failure()
+            return None
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            _record_error(exc, model)
             if _is_quota_error(exc):
                 # Free-tier RPM/RPD hit: rotate key and drop to the next model
                 # immediately -- a quota on one model says nothing about the next,
                 # so backing off here would only burn the budget.
                 log.warning("quota/rate limit on %s; rotating key and model", model)
+                _cool_down(model, exc)
                 continue
-            elif _rejects_thinking(exc) and model not in _NO_THINKING:
-                # The model refuses thinking_config. Remember that and retry it
+            saw_provider_failure = True
+            if _is_permanent_error(exc):
+                # 401/403/404: a dead key, a blocked project or a retired model.
+                # Never recoverable, so skip straight to the next model rather
+                # than sleeping first.
+                log.warning("permanent error on %s (%s); not retrying this model",
+                            model, type(exc).__name__)
+                continue
+            if _rejects_thinking(exc) and model not in _NO_THINKING:
+                # The model refuses a thinking budget. Remember that and retry it
                 # immediately rather than burning a chain step on a fixable error.
                 _NO_THINKING.add(model)
-                log.info("%s rejects thinking_config; retrying without it", model)
+                log.info("%s rejects the thinking budget; retrying without it", model)
                 try:
                     async with _semaphore():
                         payload = await asyncio.wait_for(
-                            _generate(model, client, prompt, schema, system),
+                            PROVIDER.generate(model, key, prompt, schema, system,
+                                              _NO_THINKING),
                             min(TIMEOUT_S, max(0.5, deadline - time.monotonic())))
                     if payload is not None:
                         _breaker.record_success()
+                        STATS["model_calls_ok"] += 1
+                        STATS["last_model_used"] = model
                         return payload
                 except Exception as retry_exc:  # noqa: BLE001
                     last_exc = retry_exc
+                    _record_error(retry_exc, model)
                     log.warning("model call failed on %s after retry: %s", model,
                                 type(retry_exc).__name__)
             else:
@@ -621,7 +679,8 @@ async def _call_model(prompt: str, schema: Dict[str, Any] = RESPONSE_SCHEMA,
             backoff = min(2.0, 0.25 * (2 ** attempt)) * (0.5 + random.random())
             await asyncio.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
 
-    _breaker.record_failure()
+    if saw_provider_failure:
+        _breaker.record_failure()
     if last_exc is not None:
         log.warning("interpretation call exhausted retries: %s", type(last_exc).__name__)
     return None
@@ -700,6 +759,7 @@ async def _arbitrate(disputes: List[Tuple[int, str, Dict[str, Any], Dict[str, An
         lines.append(f"  B: {b.get('directive_type')} "
                      f"{json.dumps(b.get('structured_adjustment'))}")
         lines.append("")
+    STATS["arbiter_calls"] += 1
     payload = await _call_model("\n".join(lines), _ARBITER_SCHEMA, _ARBITER_SYSTEM,
                                 deadline=deadline)
     out: Dict[int, str] = {}
@@ -805,4 +865,15 @@ async def interpret(notes: Sequence[str], hours: Sequence[Dict[str, Any]],
         # outage must not stick once the provider comes back.
         for i in pending:
             _cache_put(cache_key(notes[i], battery), merged[i])
+
+    # Record which path actually produced this request's interpretation. A run
+    # served entirely by the deterministic parser scores the same on the public
+    # cases as a healthy one, and the rubric disqualifies a submission whose LLM
+    # is not in the interpretation path -- so this has to be observable.
+    if not pending:
+        STATS["interpreted_by_cache"] += 1
+    elif used_fallback:
+        STATS["interpreted_by_fallback"] += 1
+    else:
+        STATS["interpreted_by_llm"] += 1
     return merged

@@ -18,6 +18,7 @@ deterministically, and returns a cost-optimal, fully valid 24-hour energy schedu
 | `GET` | `/health` | Readiness probe → `{"status":"ok"}` |
 | `POST` | `/optimize-energy` | Note interpretation + 24-hour optimized schedule |
 | `GET` | `/docs`, `/redoc`, `/openapi.json` | Swagger UI, ReDoc, raw OpenAPI schema |
+| `GET` | `/diagnostics` | Operational counters — is the LLM actually running? Not part of the judged contract |
 
 Status codes: `200` success · `400` malformed JSON **or structurally invalid request** ·
 `422` well-formed but semantically contradictory (e.g. `initial_energy_kwh` above
@@ -77,7 +78,11 @@ Names only; never commit values. Full list with defaults in `.env.example`.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `LLM_PROVIDER` | `gemini` | `gemini` or `anthropic`. All resilience machinery applies to either. |
 | `GEMINI_API_KEY` | — | Free Google AI Studio key. Required for the LLM path. |
+| `ANTHROPIC_API_KEY` | — | Used when `LLM_PROVIDER=anthropic`. |
+| `LLM_MODEL` / `LLM_FALLBACK_MODELS` | provider defaults | Override the chain for either provider. |
+| `LLM_MODEL_COOLDOWN_S` | `60` | How long a rate-limited model is parked before being retried. |
 | `GEMINI_API_KEYS` | — | Optional comma-separated pool, round-robined to multiply free-tier RPM headroom. |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Primary interpretation model. |
 | `GEMINI_FALLBACK_MODELS` | `gemini-flash-latest,gemini-3.5-flash,gemini-3.1-flash-lite` | Tried in order when a per-model free-tier cap is hit. |
@@ -201,12 +206,19 @@ invalid plan:
 ## Testing
 
 ```bash
+pytest                                                # 177 offline tests
+GRIDWISE_BASE_URL=http://localhost:8000 pytest        # 189, incl. live contract
 python test_local.py --offline                        # optimizer vs organizer optimal
 python test_paraphrase.py                             # 43 rewordings, extractor only
 python test_hostile.py --base-url http://localhost:8000   # malformed input drill
-python test_local.py --base-url http://localhost:8000     # full pipeline
-python test_paraphrase.py --base-url http://localhost:8000
+python test_local.py --base-url http://localhost:8000     # full pipeline + LLM-path gate
+curl -s http://localhost:8000/diagnostics             # did the model actually run?
 ```
+
+`test_local.py --base-url` **exits non-zero and prints a warning banner** if the
+deterministic parser served any request. A perfect score proves nothing if the
+model never ran, and the rubric disqualifies a submission whose LLM is not in the
+interpretation path.
 
 Measured on this build:
 
@@ -215,7 +227,9 @@ Measured on this build:
 | Public cases, offline optimizer | 10/10 valid, cost ratio 1.0000, p95 4 ms |
 | Public cases, full HTTP pipeline (live Gemini) | 10/10 interpretation, 10/10 valid, ratio 1.0000 |
 | Paraphrase suite | 43/43 |
-| Hostile input suite | 29/29, zero 5xx, no leaked values |
+| Hostile input suite | 36/36, zero 5xx, no leaked values |
+| Pytest gate | 189 passed |
+| Local test pack (`test.json`) | 92/92 interpretation notes |
 | Provider-failure drill (no key / bad key) | 10/10 valid, 43/43 paraphrases |
 | Free-tier rate-limit drill (quota exhausted mid-run) | 10/10 valid — deterministic reading took over |
 
@@ -240,7 +254,9 @@ contains **no baked secrets** — the key is supplied at runtime only.
 
 | File | Role |
 |---|---|
-| `main.py` | FastAPI app, both endpoints, Swagger metadata, error handlers, scenario cache |
+| `main.py` | FastAPI app, both endpoints, `/diagnostics`, Swagger metadata, error handlers, scenario cache |
+| `config.py` | Loads `.env` into the environment before any setting is read |
+| `providers.py` | Gemini and Anthropic behind one interface, selected by `LLM_PROVIDER` |
 | `schemas.py` | Pydantic models for the exact request/response contract |
 | `llm.py` | Gemini prompt and call (free-tier key pool, retries, cache, arbiter) + guardrails |
 | `rules.py` | Deterministic extractor: cross-check and provider-outage fallback |
@@ -249,6 +265,9 @@ contains **no baked secrets** — the key is supplied at runtime only.
 | `test_local.py` | Judge-equivalent harness over the 10 public sample cases |
 | `test_paraphrase.py` | 43 rewordings across all six directive types |
 | `test_hostile.py` | Malformed and hostile request drill |
+| `tests/test_gridwise.py` | Pytest regression gate (189 tests) |
+| `test.json` | 105-case local test pack with expected outputs |
+| `CHECKLIST.md` | Rubric compliance checklist traced to both organizer PDFs |
 | `public_cases.json` | Organizer-supplied public sample pack |
 | `Dockerfile` / `render.yaml` | Container and Render service definition |
 | `DEPLOY.md` | Deployment and verification runbook |

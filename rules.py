@@ -245,12 +245,19 @@ _ZERO_SOLAR = re.compile(
 
 
 def _solar_factor(text: str) -> Optional[float]:
-    """Return the USABLE FRACTION THAT REMAINS (Problem Statement 5.1)."""
-    if _ZERO_SOLAR.search(text):
-        return 0.0
+    """Return the USABLE FRACTION THAT REMAINS (Problem Statement 5.1).
 
+    A stated quantity always beats an outage keyword. "Half the array is offline
+    for rewiring" is a 50% reduction, not a blackout. Emitting 0.0 there would be
+    worse than emitting no_op: it is a *wrong constraint that gets applied*, so
+    the interpretation mark and the downstream-application mark are both lost and
+    the plan is optimised against solar that does not exist. A bare outage word
+    means a full outage only when no fraction or percentage is present.
+    """
     pct = _percent(text)
     frac = _fraction_word(text)
+    if pct is None and frac is None and _ZERO_SOLAR.search(text):
+        return 0.0
     value = pct if pct is not None else frac
     if value is None:
         return None
@@ -294,7 +301,20 @@ def _reserve_kwh(text: str, capacity: float) -> Optional[float]:
                               "maintain", "minimum", "no lower", "not fall"))
     if direct is not None:
         return direct
-    # "50% of the battery capacity", "a third of the pack"
+    # A percentage of capacity may sit on either side of the capacity word:
+    # "50% of the battery capacity" and "must hold 60% of capacity" both count.
+    near_cap = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:%|per\s*cent|percent)[^.]{0,40}?"
+        r"(?:capacit|pack|bank|storage|batter)"
+        r"|(?:capacit|pack|bank|storage|batter)\w*[^.]{0,40}?"
+        r"(\d+(?:\.\d+)?)\s*(?:%|per\s*cent|percent)",
+        text, re.IGNORECASE)
+    if near_cap and capacity > 0:
+        raw = near_cap.group(1) or near_cap.group(2)
+        if raw is not None:
+            return round(min(1.0, max(0.0, float(raw) / 100.0)) * capacity, 6)
+
+    # "a third of the pack", "half of the battery"
     if re.search(r"\bof\s+(?:the\s+)?(?:battery\s+)?(?:capacity|pack|bank|storage|"
                  r"battery|rated capacity)\b", text, re.IGNORECASE):
         pct = _percent(text)
@@ -338,17 +358,28 @@ _NO_DISCHARGE = re.compile(
     r"|(?:battery|batteries)\s+(?:\w+\s+){0,3}?(?:export|output|supply)\s+"
     r"(?:is\s+)?(?:not|prohibited|blocked|disabled|unavailable)"
     r"|no battery (?:export|output|support|supply|contribution)"
+    # "avoid drawing down the pack", "do not drain the battery"
+    r"|(?:avoid|no|not|never|stop|halt|suspend|refrain from|without)\s+"
+    r"(?:\w+\s+){0,3}?(?:draw(?:ing)?\s+down|drain\w*|deplet\w*|"
+    r"run(?:ning)?\s+down)"
+    r"|(?:draw(?:ing)?\s+down|drain\w*|deplet\w*)\s+(?:\w+\s+){0,3}?"
+    r"(?:must not|may not|cannot|is not|should not)"
     r"|(?:battery|batteries)\s+(?:must|may|should|can)(?:not| not)\s+"
     r"(?:\w+\s+){0,2}?(?:discharg\w*|supply|export|feed)"
     r")", re.IGNORECASE)
 
 _SOLAR_WORD = re.compile(
     r"\b(solar|pv|photovoltaic|rooftop|panel|panels|array|arrays|generation|"
-    r"irradiance|sunlight|inverter)\b", re.IGNORECASE)
+    r"irradiance|sunlight|inverter|"
+    # what actually reduces solar, named without the word "solar"
+    r"shading|shade|shaded|cloud|clouds|cloudy|overcast|haze|hazy|fog|"
+    r"soiling|dust|dusty|module|modules|string|strings)\b", re.IGNORECASE)
 
 _RESERVE_WORD = re.compile(
-    r"\b(reserve|at least|no lower than|not fall below|not drop below|"
-    r"minimum|keep|hold back|hold at least|maintain|retain|remain in the battery|"
+    r"\b(reserve|at least|no less than|no fewer than|not less than|"
+    r"no lower than|not fall below|not drop below|not go below|"
+    r"minimum|keep|keeps|hold|holds|hold back|hold at least|"
+    r"maintain|maintains|retain|retains|remain|remains|stay|stays|preserve|"
     r"stored in the battery|state of charge|soc|floor)\b", re.IGNORECASE)
 
 _GRID_WORD = re.compile(
@@ -360,8 +391,9 @@ _CAP_WORD = re.compile(
     r"limited|maximum|max|ceiling|must stay|stay at or|no higher than|"
     r"not go above|restricted to|throttled to)\b", re.IGNORECASE)
 
-_BATTERY_WORD = re.compile(r"\b(battery|batteries|pack|bank|storage|bess|soc)\b",
-                           re.IGNORECASE)
+_BATTERY_WORD = re.compile(
+    r"\b(battery|batteries|pack|bank|storage|bess|soc|state of charge|"
+    r"accumulator)\b", re.IGNORECASE)
 
 # Notes that clearly describe campus life rather than today's electricity plan.
 _DISTRACTOR = re.compile(
@@ -390,17 +422,23 @@ def _detect_type(text: str) -> Optional[str]:
                   or _ZERO_SOLAR.search(text)):
         return "solar_reduction"
 
-    if _GRID_WORD.search(text) and _CAP_WORD.search(text) and \
-            re.search(r"\d", text) and not _RESERVE_WORD.search(text):
+    # A reserve directive is about the *battery*, so it needs a battery word or
+    # the noun "reserve" itself. Without one, cue words shared with grid caps
+    # ("keep", "stay", "maintain", "no lower than") belong to the grid sentence:
+    # "grid intake must stay at or below 190 kWh" is a cap, not a reserve.
+    reserve_subject = battery or re.search(r"\breserves?\b", text, re.IGNORECASE)
+    reserve_like = bool(_RESERVE_WORD.search(text)) and bool(reserve_subject)
+    grid_like = bool(_GRID_WORD.search(text)) and bool(_CAP_WORD.search(text))
+    has_number = bool(re.search(r"\d", text))
+
+    if grid_like and has_number and not reserve_like:
         return "max_grid_window"
 
-    if (battery or _RESERVE_WORD.search(text)) and _RESERVE_WORD.search(text) \
-            and re.search(r"\d", text):
-        # "at least 90 kWh in the battery", "keep 50% of capacity"
-        if battery or re.search(r"kwh", text, re.IGNORECASE):
-            return "minimum_battery_reserve"
+    if reserve_like and has_number and (battery
+                                        or re.search(r"kwh", text, re.IGNORECASE)):
+        return "minimum_battery_reserve"
 
-    if _GRID_WORD.search(text) and _CAP_WORD.search(text) and re.search(r"\d", text):
+    if grid_like and has_number:
         return "max_grid_window"
     return None
 
