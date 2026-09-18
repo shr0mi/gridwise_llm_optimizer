@@ -159,6 +159,12 @@ class DirectiveInterpretation(BaseModel):
         "directive_type": "solar_reduction",
         "structured_adjustment": {"hours": [13, 14], "factor": 0.2},
         "explanation": "Usable solar is scaled to 0.2 of forecast over hours 13-14.",
+    }, {
+        "note_index": 1,
+        "applies": False,
+        "directive_type": "no_op",
+        "structured_adjustment": None,
+        "explanation": "This note does not affect today's energy schedule.",
     }]})
 
     note_index: int = Field(
