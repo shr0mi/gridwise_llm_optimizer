@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.jpeg" alt="GridWise LLM logo" width="180">
+  <img src="logo.jpeg" alt="GridWise LLM logo" width="100">
 </p>
 
 <h1 align="center">GridWise LLM</h1>
@@ -7,6 +7,10 @@
 <p align="center">
   <strong>Smart campus energy scheduler, powered by a language model.</strong><br>
   Turn free-form operator notes into a cost-optimal 24-hour battery &amp; solar plan.
+</p>
+
+<p align="center">
+  <strong>Team:</strong> <code>DU_Context_Limit_Exceed</code> · <strong>Event:</strong> BUP CSE Fest 2026 Hackathon · Online Preliminary
 </p>
 
 <p align="center">
@@ -450,5 +454,5 @@ A public Docker Hub image is the documented fallback — the Dockerfile builds i
 
 <p align="center">
   Built for the <strong>BUP CSE Fest 2026 Hackathon · Online Preliminary</strong><br>
-  by <strong>GridWise LLM</strong>
+  by <strong>Team <code>DU_Context_Limit_Exceed</code></strong>
 </p>
