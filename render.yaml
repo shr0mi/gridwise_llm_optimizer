@@ -12,6 +12,18 @@ services:
     autoDeploy: true
     envVars:
       # Secrets are set in the Render dashboard, never in this file or the image.
+      - key: LLM_PROVIDER
+        value: openai
+      - key: LLM_FALLBACK_PROVIDERS
+        value: gemini
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEYS
+        sync: false
+      - key: LLM_MODEL
+        value: gpt-5.4-mini
+      - key: LLM_FALLBACK_MODELS
+        value: gpt-5.4-nano
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_API_KEYS
@@ -19,11 +31,15 @@ services:
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
       - key: GEMINI_FALLBACK_MODELS
-        value: gemini-flash-latest,gemini-3.5-flash,gemini-3.1-flash-lite
+        value: gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3.5-flash-lite
       - key: LLM_MAX_CONCURRENCY
         value: "4"
       - key: LLM_TIMEOUT_S
+        value: "8"
+      - key: LLM_TOTAL_BUDGET_S
         value: "12"
+      - key: LLM_MAX_ATTEMPTS
+        value: "6"
       - key: REQUEST_BUDGET_S
         value: "25"
       - key: WEB_CONCURRENCY

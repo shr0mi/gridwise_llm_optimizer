@@ -18,9 +18,14 @@ GRIDWISE_BASE_URL=http://localhost:8000 pytest        # 189 tests
 curl -s http://localhost:8000/diagnostics             # is the LLM actually running?
 ```
 
-Last full run: **10/10 interpretation · 10/10 valid · cost ratio 1.0000 · 43/43
-paraphrases · 36/36 hostile · 189 pytest · `interpreted_by_llm: 10,
-interpreted_by_fallback: 0`.**
+Last full run, **OpenAI `gpt-5.4-mini` primary / Gemini fallback**:
+**10/10 interpretation · 10/10 valid · cost ratio 1.0000 · p95 2.99 s ·
+43/43 paraphrases deterministic · 43/43 paraphrases through the live LLM ·
+36/36 hostile · 189 pytest · 24/24 concurrent (p95 126 ms) ·
+`interpreted_by_llm: 57, interpreted_by_fallback: 0`.**
+
+Provider chain drilled: with the OpenAI key deliberately invalidated, Gemini took
+over automatically and the run still scored 10/10.
 
 ---
 
@@ -28,7 +33,7 @@ interpreted_by_fallback: 0`.**
 
 | # | Requirement | Source | Status |
 |---|---|---|---|
-| 0.1 | LLM is in the operator-note interpretation path, producing the structured directives the optimizer consumes | PS §02, PG §04 | `[x]` `llm.interpret` calls the model first on every uncached note; its guard-railed output is the default reading |
+| 0.1 | LLM is in the operator-note interpretation path, producing the structured directives the optimizer consumes | PS §02, PG §04 | `[x]` verified live: `interpreted_by_llm: 57, interpreted_by_fallback: 0` on OpenAI `gpt-5.4-mini` |
 | 0.2 | LLM is **not** used only for `plan_summary` / docs | PG §04, §09 | `[x]` `plan_summary` is built by deterministic code in `main._summarize`; the model never writes it |
 | 0.3 | Hard-coded phrase matching is **not** the sole interpreter | PG §04 | `[x]` `rules.py` is a cross-check and outage path only; the model runs first and wins by default |
 | 0.4 | **Proof the model actually ran** | PG §09 | `[x]` `/diagnostics` reports `interpreted_by_llm` / `_by_fallback`; `test_local.py` prints a warning banner and **exits non-zero** on a degraded run |
@@ -121,7 +126,7 @@ Trap coverage (PS §5.1, §11.4, PG §08 "Time & factor normalization"):
 | # | Sub-criterion | Pts | Status |
 |---|---|---|---|
 | 5.1 | Health readiness within 60 s | 2 | `[x]` `/health` is a static literal — no model, no solver |
-| 5.2 | p95 latency ≤ 5 s | 3 | `[~]` 6.8 s p95 measured on a rate-limited free key; ~2 s when quota is fresh. **Add more keys** — see §8 |
+| 5.2 | p95 latency ≤ 5 s | 3 | `[x]` **2.99 s** with OpenAI primary (was 6.8 s on Gemini alone); 126 ms p95 under 24-way concurrency |
 | 5.3 | Stability / failure rate | 3 | `[x]` 0 failures across 36 hostile + 189 pytest + repeated-request checks |
 | 5.4 | Malformed & provider-failure handling, secret safety | 2 | `[x]` verified with no key, a bogus key, and a live 429 storm |
 
@@ -170,10 +175,9 @@ Trap coverage (PS §5.1, §11.4, PG §08 "Time & factor normalization"):
 
 ## 8. Open items — human action required
 
-1. `[ ]` **Add 2–3 more free Gemini keys from *different* Google Cloud projects**
-   → `GEMINI_API_KEYS=k1,k2,k3`. Quota is 20 requests/minute **per model per
-   project**. This is the single highest-value change left: it is what moves p95
-   from ~7 s back under the 5 s full-marks threshold.
+1. `[x]` **Latency resolved** by making OpenAI the primary provider: p95 2.99 s,
+   inside the ≤ 5 s full-marks band. Gemini remains the fallback provider. Adding
+   more Gemini keys is now a nice-to-have, not a blocker.
 2. `[ ]` **Deploy + uptime pinger** (`DEPLOY.md` §4–5).
 3. `[ ]` **Docker image**: build, push, verify pull-and-run from a clean machine.
 4. `[ ]` **Repo public after the deadline**; confirm redistributing the organizer
@@ -185,7 +189,10 @@ Trap coverage (PS §5.1, §11.4, PG §08 "Time & factor normalization"):
    as infeasible. Low probability, but it silently costs a whole hidden case.
    Fix would be to solve at the exact cap and rely on the round-then-rederive
    step, or shrink the margin to 1e-9.
-8. `[~]` **Anthropic provider is wired but never exercised against a live key.**
+8. `[x]` **OpenAI provider verified live** — key valid, inference works, strict
+   `json_schema` structured output confirmed, 10/10 public cases, 43/43
+   paraphrases, cross-provider failover drilled.
+9. `[~]` **Anthropic provider is wired but never exercised against a live key.**
    `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` switches providers; the schema
    translation and client construction are unit-tested, but no real call has been
    made. Test it before relying on it in the round.

@@ -4,5 +4,8 @@ pydantic==2.12.5
 numpy==2.2.6
 scipy==1.16.3
 google-genai==2.24.0
+# OpenAI provider transport. The openai SDK 3.16 hits a RecursionError in
+# ssl.SSLContext.verify_mode when httpx and httpx2 are both installed.
+httpx==0.28.1
 # Second provider, used when LLM_PROVIDER=anthropic. Harmless if unused.
 anthropic==0.75.0

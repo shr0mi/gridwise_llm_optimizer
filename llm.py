@@ -1,4 +1,4 @@
-"""Operator-note interpretation: Gemini call + deterministic guardrails.
+"""Operator-note interpretation: model call + deterministic guardrails.
 
 The language model is the interpreter and is always on the path -- the Problem
 Statement makes that mandatory and the Participant Guide disqualifies solutions
@@ -6,17 +6,22 @@ where an LLM only writes ``plan_summary``. Everything the model returns is
 treated as untrusted structured data and must survive :func:`sanitize` before
 the optimizer is allowed to see it.
 
-Tuned for a FREE-TIER API key:
+Built to keep answering when a provider does not:
 
-  * a key pool (``GEMINI_API_KEYS``) rotated on 429 / quota errors;
-  * a model fallback chain, so a per-model daily cap does not end the round;
+  * a provider chain (``LLM_PROVIDER`` then ``LLM_FALLBACK_PROVIDERS``) -- an
+    exhausted or dead primary degrades to the next provider, not to no LLM;
+  * a key pool per provider, rotated on 429 / quota errors;
+  * a model chain per provider, so a per-model daily cap does not end the round;
+  * a per-route cooldown that parks a rate-limited model for the delay the API
+    reports, and a dead key or retired model for much longer;
   * bounded concurrency + retry with jittered backoff, to stay under the
     free-tier requests-per-minute ceiling instead of hammering through it;
   * a normalized note cache, which is the single biggest quota saver -- repeated
     and near-repeated notes across the hidden set never reach the provider, and
     the same note always yields the same answer;
+  * a per-provider circuit breaker, so a dead OpenAI cannot black out Gemini;
   * a deterministic cross-check (:mod:`rules`) that catches disagreement and
-    carries the service through a provider outage rather than emitting no_op for
+    carries the service through a total outage rather than emitting no_op for
     every note.
 """
 from __future__ import annotations
@@ -69,25 +74,52 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-#: Which provider drives interpretation. All the resilience machinery below --
-#: key pool, breaker, model chain, cache, cross-check, arbiter -- applies to
-#: whichever one is selected, so switching is a single environment variable.
+#: The primary provider, then the providers to fall back to. Every piece of
+#: resilience machinery below -- key pools, breakers, cooldowns, note cache,
+#: cross-check, arbiter -- applies across the whole chain, so a dead primary
+#: provider degrades to the next one rather than to no LLM at all.
 PROVIDER_NAME = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+FALLBACK_PROVIDER_NAMES = [n.strip().lower() for n in
+                           os.getenv("LLM_FALLBACK_PROVIDERS", "").split(",")
+                           if n.strip()]
 PROVIDER = providers.get_provider(PROVIDER_NAME)
+PROVIDER_CHAIN = [PROVIDER] + [providers.get_provider(n)
+                               for n in FALLBACK_PROVIDER_NAMES
+                               if n != PROVIDER_NAME]
 
-# Model names are read from the provider-specific variables first so an existing
-# GEMINI_MODEL keeps working, then fall back to the provider's own defaults.
-MODEL = (os.getenv("LLM_MODEL") or os.getenv("GEMINI_MODEL")
-         or PROVIDER.default_model)
-_raw_fallbacks = (os.getenv("LLM_FALLBACK_MODELS")
-                  or os.getenv("GEMINI_FALLBACK_MODELS") or "")
-FALLBACK_MODELS = ([m.strip() for m in _raw_fallbacks.split(",") if m.strip()]
-                   or list(PROVIDER.default_fallbacks))
-MODEL_CHAIN: List[str] = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
+
+def _models_for(provider: Any, primary: bool) -> List[str]:
+    """Model list for one provider: env override, else its own defaults."""
+    if primary:
+        model = (os.getenv("LLM_MODEL") or os.getenv("GEMINI_MODEL")
+                 or provider.default_model)
+        raw = (os.getenv("LLM_FALLBACK_MODELS")
+               or os.getenv("GEMINI_FALLBACK_MODELS") or "")
+    else:
+        prefix = provider.name.upper()
+        model = os.getenv(f"{prefix}_MODEL") or provider.default_model
+        raw = os.getenv(f"{prefix}_FALLBACK_MODELS") or ""
+        if provider.name == "gemini" and not raw:
+            raw = os.getenv("GEMINI_FALLBACK_MODELS") or ""
+    extras = ([m.strip() for m in raw.split(",") if m.strip()]
+              or list(provider.default_fallbacks))
+    return [model] + [m for m in extras if m != model]
+
+
+#: The ordered list of (provider, model) routes tried on every interpretation.
+ROUTES: List[Tuple[Any, str]] = [
+    (provider, model)
+    for index, provider in enumerate(PROVIDER_CHAIN)
+    for model in _models_for(provider, index == 0)
+]
+
+#: Kept for readability in logs and /diagnostics.
+MODEL = ROUTES[0][1] if ROUTES else ""
+MODEL_CHAIN: List[str] = [f"{p.name}:{m}" for p, m in ROUTES]
 
 TIMEOUT_S = _env_float("LLM_TIMEOUT_S", 8.0)
 # One attempt per model in the chain, so a rate-limited primary walks all of it.
-MAX_ATTEMPTS = _env_int("LLM_MAX_ATTEMPTS", max(3, len(FALLBACK_MODELS) + 1))
+MAX_ATTEMPTS = _env_int("LLM_MAX_ATTEMPTS", max(3, len(ROUTES)))
 # Whole-interpretation ceiling. Walking the model chain must finish inside this,
 # otherwise the outer request budget kills it and the latency score suffers even
 # though the deterministic reading would have answered in milliseconds.
@@ -127,37 +159,45 @@ def _semaphore() -> asyncio.Semaphore:
 # -------------------------------------------------------------- client pooling
 
 _clients: Dict[str, Any] = {}
-_keys: Optional[List[str]] = None
-_key_cursor = 0
 _import_failed = False
 
+_keys_by_provider: Dict[str, List[str]] = {}
+_cursor_by_provider: Dict[str, int] = {}
 
-def _api_keys() -> List[str]:
-    global _keys
-    if _keys is not None:
-        return _keys
+
+def keys_for(provider: Any) -> List[str]:
+    """Key pool for one provider. Each provider has its own quota."""
+    if provider.name in _keys_by_provider:
+        return _keys_by_provider[provider.name]
     raw = ""
-    for env_name in PROVIDER.key_envs:
+    for env_name in provider.key_envs:
         raw = os.getenv(env_name) or ""
         if raw:
             break
-    _keys = [k.strip() for k in raw.split(",") if k.strip()]
-    if not _keys:
-        log.warning("no %s API key configured (%s) - interpretation will use "
-                    "the deterministic fallback path",
-                    PROVIDER.name, "/".join(PROVIDER.key_envs))
-    return _keys
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
+        log.info("no %s API key configured (%s)", provider.name,
+                 "/".join(provider.key_envs))
+    _keys_by_provider[provider.name] = keys
+    return keys
 
 
-def _next_key() -> Optional[str]:
-    """Round-robin the key pool so one free-tier quota is not the ceiling."""
-    global _key_cursor
-    keys = _api_keys()
+def _next_key(provider: Any) -> Optional[str]:
+    """Round-robin one provider's key pool so a single quota is not the ceiling."""
+    keys = keys_for(provider)
     if not keys:
         return None
-    key = keys[_key_cursor % len(keys)]
-    _key_cursor += 1
-    return key
+    cursor = _cursor_by_provider.get(provider.name, 0)
+    _cursor_by_provider[provider.name] = cursor + 1
+    return keys[cursor % len(keys)]
+
+
+def _api_keys() -> List[str]:
+    """Every configured key across the whole provider chain."""
+    out: List[str] = []
+    for provider in PROVIDER_CHAIN:
+        out.extend(keys_for(provider))
+    return out
 
 
 def llm_available() -> bool:
@@ -166,11 +206,14 @@ def llm_available() -> bool:
 
 def reset_for_tests() -> None:
     """Drop cached keys/clients/cache so tests can re-read the environment."""
-    global _keys, _clients, _key_cursor, _import_failed
-    _keys = None
+    global _clients, _import_failed
     _clients = {}
-    _key_cursor = 0
     _import_failed = False
+    _keys_by_provider.clear()
+    _cursor_by_provider.clear()
+    _MODEL_COOLDOWN.clear()
+    for breaker in _breakers.values():
+        breaker.record_success()
     _cache.clear()
     _breaker.record_success()
     providers.reset()
@@ -210,7 +253,19 @@ class _Breaker:
         self.failures = 0
 
 
+_breakers: Dict[str, "_Breaker"] = {}
+
+
+def breaker_for(provider: Any) -> "_Breaker":
+    """One breaker per provider -- a dead OpenAI must not black out Gemini."""
+    if provider.name not in _breakers:
+        _breakers[provider.name] = _Breaker()
+    return _breakers[provider.name]
+
+
+#: Back-compat alias: the primary provider's breaker.
 _breaker = _Breaker()
+_breakers[PROVIDER.name] = _breaker
 
 
 # --------------------------------------------------------------------- the prompt
@@ -231,7 +286,12 @@ SUPPORTED DIRECTIVE TYPES AND THEIR EXACT structured_adjustment SHAPES
 
 RULE 1 - TIME WINDOWS ARE START-INCLUSIVE AND END-EXCLUSIVE.
 List every whole hour the window covers, starting at the start hour and stopping
-BEFORE the end hour.
+BEFORE the end hour. This applies to EVERY range word with no exceptions --
+"to", "until", "till", "through", "thru", "-", and "between X and Y" all behave
+the same way. In particular "through" does NOT include the end hour:
+  "from 7 PM through 9 PM"  -> [19, 20]      NOT [19, 20, 21]
+  "between 11 AM and 2 PM"  -> [11, 12, 13]  NOT [11, 12, 13, 14]
+The number of hours listed always equals end_hour - start_hour.
   "1 PM to 3 PM"            -> [13, 14]
   "noon until 2 PM"         -> [12, 13]
   "from 2 AM until 5 AM"    -> [2, 3, 4]
@@ -244,6 +304,15 @@ BEFORE the end hour.
   "throughout the day"      -> [0,1,2,...,23]   (all 24 hours)
   "until midnight" means the end hour is 24, so the last listed hour is 23.
 hours must be unique integers 0-23 sorted in ASCENDING order.
+
+RULE 1b - BARE HOURS WITH NO AM/PM MARKER. Campus maintenance happens during the
+working day, so a bare 1-6 means the AFTERNOON and a bare 7-11 means the MORNING.
+  "panel washing from one until three"  -> [13, 14]     (1 PM to 3 PM)
+  "from two until five"                 -> [14, 15, 16]
+  "from nine until eleven"              -> [9, 10]
+  "from 10 until 12"                    -> [10, 11]
+Only read a bare 1-6 as the small hours when the note says so ("overnight",
+"early morning", "before dawn").
 
 RULE 2 - factor IS THE FRACTION THAT REMAINS USABLE, NOT THE REDUCTION.
   "an 80% reduction in solar"          -> factor 0.2
@@ -280,12 +349,16 @@ sentence.
 WORKED EXAMPLES
 Note: "Crews wash the array from 9 AM to 11 AM; expect about 40% of normal output."
   -> solar_reduction, applies true, {"hours": [9, 10], "factor": 0.4}
+Note: "Panel washing from one until three leaves roughly one-fifth of normal output."
+  -> solar_reduction, applies true, {"hours": [13, 14], "factor": 0.2}
 Note: "Hold back a third of the 300 kWh pack from 7 PM until 11 PM."
   -> minimum_battery_reserve, applies true, {"hours": [19,20,21,22], "minimum_energy_kwh": 100}
 Note: "The charger stays locked out between 1 AM and 4 AM."
   -> no_charge_window, applies true, {"hours": [1, 2, 3]}
 Note: "Relay tests mean no battery export from 5 PM to 7 PM."
   -> no_discharge_window, applies true, {"hours": [17, 18]}
+Note: "Battery discharging is disabled from 7 PM through 9 PM."
+  -> no_discharge_window, applies true, {"hours": [19, 20]}
 Note: "Feeder works cap us at 140 kWh of import from 8 PM to 11 PM."
   -> max_grid_window, applies true, {"hours": [20, 21, 22], "max_grid_kwh": 140}
 Note: "Battery state of charge must not fall below 75 kWh from 8 PM until 11 PM."
@@ -542,7 +615,10 @@ _RETRY_AFTER_RE = re.compile(r"retry in ([0-9.]+)s", re.IGNORECASE)
 DEFAULT_COOLDOWN_S = _env_float("LLM_MODEL_COOLDOWN_S", 60.0)
 
 
-def _cool_down(model: str, exc: BaseException) -> None:
+PERMANENT_COOLDOWN_S = _env_float("LLM_PERMANENT_COOLDOWN_S", 900.0)
+
+
+def _cool_down(model: str, exc: BaseException, permanent: bool = False) -> None:
     """Park a rate-limited model instead of rediscovering its 429 every request.
 
     The free tier caps requests per minute *per model*, and the 429 body carries
@@ -550,23 +626,44 @@ def _cool_down(model: str, exc: BaseException) -> None:
     three seconds re-confirming the same limit on every single request, which is
     latency spent to learn nothing.
     """
-    match = _RETRY_AFTER_RE.search(str(exc))
-    delay = float(match.group(1)) if match else DEFAULT_COOLDOWN_S
-    delay = max(1.0, min(delay, 300.0))
+    if permanent:
+        # A dead key, a blocked project or a retired model. Retrying it every
+        # minute just burns a second of the budget to relearn the same thing.
+        delay = PERMANENT_COOLDOWN_S
+    else:
+        match = _RETRY_AFTER_RE.search(str(exc))
+        delay = float(match.group(1)) if match else DEFAULT_COOLDOWN_S
+        delay = max(1.0, min(delay, 300.0))
     _MODEL_COOLDOWN[model] = time.monotonic() + delay
     log.info("parking %s for %.0fs after a rate limit", model, delay)
 
 
-def _usable_models() -> List[str]:
-    """The chain minus models still cooling off, in preference order."""
+def _route_id(provider: Any, model: str) -> str:
+    return f"{provider.name}:{model}"
+
+
+def _usable_routes() -> List[Tuple[Any, str]]:
+    """Routes minus those still cooling off, in preference order.
+
+    A route is skipped when it has no key at all, when its model is rate-limited
+    or when its provider's breaker is open -- so an exhausted OpenAI quota moves
+    straight on to Gemini instead of retrying a route that cannot work.
+    """
     now = time.monotonic()
-    ready = [m for m in MODEL_CHAIN if _MODEL_COOLDOWN.get(m, 0.0) <= now]
+    ready = [(p, m) for p, m in ROUTES
+             if keys_for(p)
+             and not breaker_for(p).open
+             and _MODEL_COOLDOWN.get(_route_id(p, m), 0.0) <= now]
     if ready:
         return ready
-    # Everything is cooling. Probe only the one closest to being usable -- a
-    # stale cooldown must never black out the model path, but walking the whole
-    # chain to collect four more 429s just burns the budget.
-    return [min(MODEL_CHAIN, key=lambda m: _MODEL_COOLDOWN.get(m, 0.0))]
+    # Everything is cooling or broken. Probe only the route closest to being
+    # usable: a stale cooldown must never black out the model path, but walking
+    # the whole chain to collect more 429s just burns the budget.
+    candidates = [(p, m) for p, m in ROUTES if keys_for(p)]
+    if not candidates:
+        return []
+    return [min(candidates,
+                key=lambda r: _MODEL_COOLDOWN.get(_route_id(r[0], r[1]), 0.0))]
 
 
 def cooldowns() -> Dict[str, int]:
@@ -574,115 +671,131 @@ def cooldowns() -> Dict[str, int]:
     return {m: int(t - now) for m, t in _MODEL_COOLDOWN.items() if t > now}
 
 
+def route_status() -> List[Dict[str, Any]]:
+    """Per-route health, for /diagnostics."""
+    now = time.monotonic()
+    out = []
+    for provider, model in ROUTES:
+        rid = _route_id(provider, model)
+        out.append({
+            "route": rid,
+            "keys": len(keys_for(provider)),
+            "breaker_open": breaker_for(provider).open,
+            "cooling_for_s": max(0, int(_MODEL_COOLDOWN.get(rid, 0.0) - now)),
+        })
+    return out
+
+
 async def _call_model(prompt: str, schema: Dict[str, Any] = RESPONSE_SCHEMA,
                       system: str = SYSTEM_INSTRUCTION,
                       deadline: Optional[float] = None) -> Any:
-    """One guarded generation, walking the key pool and the model chain.
+    """One guarded generation, walking the provider/model routes.
 
     ``deadline`` is an absolute ``time.monotonic()`` value. Every attempt is
     clipped to the time left, so the chain gives up in time for the caller to
     fall back gracefully instead of being cut off mid-flight.
     """
-    if not llm_available():
-        STATS["last_llm_error"] = "no API key configured"
-        return None
-    if _breaker.open:
-        STATS["last_llm_error"] = "circuit breaker open"
+    routes = _usable_routes()
+    if not routes:
+        STATS["last_llm_error"] = ("no API key configured"
+                                   if not _api_keys() else "all routes unavailable")
         return None
     if deadline is None:
         deadline = time.monotonic() + TOTAL_BUDGET_S
 
-    chain = _usable_models()
-    attempts = max(1, min(MAX_ATTEMPTS, len(chain)))
+    attempts = max(1, min(MAX_ATTEMPTS, len(routes)))
     last_exc: Optional[BaseException] = None
     # A rate limit is a property of one model's quota, not of the provider, and
-    # the per-model cooldown already handles it. Only a genuine provider problem
-    # should trip the breaker -- otherwise a busy minute blacks out the LLM path
-    # for everyone, which is exactly the failure this whole module exists to avoid.
-    saw_provider_failure = False
+    # the per-route cooldown already handles it. Only a genuine provider problem
+    # should trip that provider's breaker.
+    failed_providers: set = set()
+
     for attempt in range(attempts):
         remaining = deadline - time.monotonic()
         if remaining < 0.5:
             log.warning("interpretation budget exhausted after %d attempt(s)", attempt)
             break
-        model = chain[min(attempt, len(chain) - 1)]
-        key = _next_key()
+        provider, model = routes[min(attempt, len(routes) - 1)]
+        rid = _route_id(provider, model)
+        key = _next_key(provider)
         if key is None:
-            return None
+            continue
         try:
             async with _semaphore():
                 payload = await asyncio.wait_for(
-                    PROVIDER.generate(model, key, prompt, schema, system,
+                    provider.generate(model, key, prompt, schema, system,
                                       _NO_THINKING),
                     min(TIMEOUT_S, remaining))
             if payload is not None:
-                _breaker.record_success()
+                breaker_for(provider).record_success()
                 STATS["model_calls_ok"] += 1
-                STATS["last_model_used"] = model
+                STATS["last_model_used"] = rid
                 return payload
             last_exc = ValueError("empty model response")
-            _record_error(last_exc, model)
+            _record_error(last_exc, rid)
         except asyncio.TimeoutError as exc:
             last_exc = exc
-            saw_provider_failure = True
-            _record_error(exc, model)
-            log.warning("model call timed out after %ss (model=%s)", TIMEOUT_S, model)
+            failed_providers.add(provider.name)
+            _record_error(exc, rid)
+            log.warning("model call timed out after %ss (route=%s)", TIMEOUT_S, rid)
         except providers.ProviderUnavailable as exc:
             # The SDK is missing or a client cannot be built. Nothing downstream
-            # will fix that, so stop the whole chain now.
-            _record_error(exc, model)
-            log.error("provider %s unavailable: %s", PROVIDER.name, exc)
-            _breaker.record_failure()
-            return None
+            # will fix that for this provider, so open its breaker and move to
+            # the next route rather than retrying it.
+            _record_error(exc, rid)
+            log.error("provider %s unavailable: %s", provider.name, exc)
+            for _ in range(BREAKER_THRESHOLD):
+                breaker_for(provider).record_failure()
+            continue
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            _record_error(exc, model)
+            _record_error(exc, rid)
             if _is_quota_error(exc):
-                # Free-tier RPM/RPD hit: rotate key and drop to the next model
-                # immediately -- a quota on one model says nothing about the next,
-                # so backing off here would only burn the budget.
-                log.warning("quota/rate limit on %s; rotating key and model", model)
-                _cool_down(model, exc)
+                # Rate or quota limit: park this route and move on immediately.
+                # A quota on one model says nothing about the next, so backing
+                # off here would only burn the budget.
+                log.warning("quota/rate limit on %s; moving to the next route", rid)
+                _cool_down(rid, exc)
                 continue
-            saw_provider_failure = True
             if _is_permanent_error(exc):
                 # 401/403/404: a dead key, a blocked project or a retired model.
-                # Never recoverable, so skip straight to the next model rather
-                # than sleeping first.
-                log.warning("permanent error on %s (%s); not retrying this model",
-                            model, type(exc).__name__)
+                # Never recoverable, so skip straight on without sleeping.
+                log.warning("permanent error on %s (%s); parking this route",
+                            rid, type(exc).__name__)
+                _cool_down(rid, exc, permanent=True)
                 continue
+            failed_providers.add(provider.name)
             if _rejects_thinking(exc) and model not in _NO_THINKING:
                 # The model refuses a thinking budget. Remember that and retry it
-                # immediately rather than burning a chain step on a fixable error.
+                # immediately rather than burning a route on a fixable error.
                 _NO_THINKING.add(model)
-                log.info("%s rejects the thinking budget; retrying without it", model)
+                log.info("%s rejects the thinking budget; retrying without it", rid)
                 try:
                     async with _semaphore():
                         payload = await asyncio.wait_for(
-                            PROVIDER.generate(model, key, prompt, schema, system,
+                            provider.generate(model, key, prompt, schema, system,
                                               _NO_THINKING),
                             min(TIMEOUT_S, max(0.5, deadline - time.monotonic())))
                     if payload is not None:
-                        _breaker.record_success()
+                        breaker_for(provider).record_success()
                         STATS["model_calls_ok"] += 1
-                        STATS["last_model_used"] = model
+                        STATS["last_model_used"] = rid
                         return payload
                 except Exception as retry_exc:  # noqa: BLE001
                     last_exc = retry_exc
-                    _record_error(retry_exc, model)
-                    log.warning("model call failed on %s after retry: %s", model,
+                    _record_error(retry_exc, rid)
+                    log.warning("model call failed on %s after retry: %s", rid,
                                 type(retry_exc).__name__)
             else:
-                log.warning("model call failed on %s: %s", model, type(exc).__name__)
+                log.warning("model call failed on %s: %s", rid, type(exc).__name__)
         if attempt < attempts - 1:
             backoff = min(2.0, 0.25 * (2 ** attempt)) * (0.5 + random.random())
             await asyncio.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
 
-    if saw_provider_failure:
-        _breaker.record_failure()
+    for name in failed_providers:
+        breaker_for(providers.get_provider(name)).record_failure()
     if last_exc is not None:
-        log.warning("interpretation call exhausted retries: %s", type(last_exc).__name__)
+        log.warning("interpretation call exhausted routes: %s", type(last_exc).__name__)
     return None
 
 
@@ -728,6 +841,10 @@ of a campus operator note. Apply these rules exactly:
 
   * Time windows are START-INCLUSIVE and END-EXCLUSIVE: "1 PM to 3 PM" -> [13,14].
   * A colon means a 24-hour clock: "01:00 to 04:00" -> [1,2,3].
+  * A BARE hour with no AM/PM: 1-6 means the afternoon, 7-11 the morning.
+    "from one until three" -> [13,14], not [1,2].
+  * "through" is end-exclusive like every other range word:
+    "7 PM through 9 PM" -> [19,20], not [19,20,21].
   * For solar_reduction, `factor` is the fraction of solar that REMAINS usable:
     an 80% reduction means factor 0.2.
   * A note that does not change today's electricity schedule is no_op.

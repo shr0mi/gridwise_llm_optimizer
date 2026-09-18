@@ -196,10 +196,14 @@ async def diagnostics() -> Dict[str, Any]:
         and stats["interpreted_by_cache"] == 0)
     return {
         "provider": llm.PROVIDER.name,
+        "provider_chain": [p.name for p in llm.PROVIDER_CHAIN],
         "model_chain": llm.MODEL_CHAIN,
+        "routes": llm.route_status(),
         "keys_configured": len(llm._api_keys()),
+        "keys_by_provider": {p.name: len(llm.keys_for(p))
+                             for p in llm.PROVIDER_CHAIN},
         "llm_available": llm.llm_available(),
-        "breaker_open": llm._breaker.open,
+        "breaker_open": llm.breaker_for(llm.PROVIDER).open,
         "models_cooling_down": llm.cooldowns(),
         "degraded": degraded,
         **stats,

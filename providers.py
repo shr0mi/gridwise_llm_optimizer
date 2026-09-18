@@ -6,8 +6,10 @@ the deterministic guardrails. This module owns only "turn a prompt plus a JSON
 schema into parsed JSON", once per provider, so that machinery applies to
 whichever provider is selected by ``LLM_PROVIDER``.
 
-Two providers ship:
+Three providers ship:
 
+``openai``     OpenAI chat completions with strict JSON-schema structured
+               output, over httpx (see the class docstring for why not the SDK).
 ``gemini``     Google AI Studio via ``google-genai``. Free tier is enough for
                this round; quotas are per model and per project.
 ``anthropic``  Claude via the ``anthropic`` SDK, for when Gemini is unavailable
@@ -23,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Dict, Optional, Set
 
 log = logging.getLogger("gridwise.providers")
@@ -222,7 +225,138 @@ class AnthropicProvider:
         return parse_payload(text, "interpretations", "choices")
 
 
-_REGISTRY = {"gemini": GeminiProvider, "anthropic": AnthropicProvider}
+
+# ----------------------------------------------------------------------- OpenAI
+
+
+def to_strict_json_schema(gemini_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate our schema into OpenAI strict-mode JSON Schema.
+
+    Strict mode requires every property to appear in ``required`` and
+    ``additionalProperties: false`` on every object. Fields that are logically
+    optional (a ``factor`` only exists on a solar_reduction) become nullable
+    unions instead, which is the supported way to express "may be absent".
+    """
+    def convert(node: Any, optional: bool = False) -> Dict[str, Any]:
+        if not isinstance(node, dict):
+            return {"type": "string"}
+        out: Dict[str, Any] = {}
+        node_type = node.get("type", "OBJECT")
+        base = node_type.lower() if isinstance(node_type, str) else "object"
+        nullable = bool(node.get("nullable")) or optional
+        out["type"] = [base, "null"] if nullable else base
+        if "enum" in node:
+            out["enum"] = list(node["enum"])
+        if base == "array":
+            out["items"] = convert(node.get("items", {"type": "STRING"}))
+        if base == "object":
+            props = node.get("properties", {}) or {}
+            # Everything is required in strict mode; optionality is expressed by
+            # allowing null.
+            out["properties"] = {k: convert(v, optional=True) for k, v in props.items()}
+            out["required"] = list(props)
+            out["additionalProperties"] = False
+        return out
+
+    root = convert(gemini_schema)
+    # The top level must not be nullable and keeps its own required list.
+    root["type"] = "object"
+    root["required"] = list((gemini_schema.get("properties") or {}))
+    return root
+
+
+class OpenAIProvider:
+    """OpenAI chat completions over httpx.
+
+    Deliberately not the ``openai`` SDK: version 3.16 raises
+    ``RecursionError: maximum recursion depth exceeded`` inside
+    ``ssl.SSLContext.verify_mode`` whenever ``httpx`` and ``httpx2`` are both
+    installed (the Anthropic SDK pulls in ``httpx2``). A direct httpx call is
+    one HTTP POST, has no such conflict, and was verified end to end.
+    """
+
+    name = "openai"
+    key_envs = ("OPENAI_API_KEYS", "OPENAI_API_KEY")
+    #: Measured against the real interpretation prompt: gpt-5.4-mini 2.15s,
+    #: gpt-5.4-nano 4.34s. Both extracted the window and factor correctly.
+    default_model = "gpt-5.4-mini"
+    default_fallbacks = ("gpt-5.4-nano",)
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+
+    def __init__(self) -> None:
+        self._clients: Dict[tuple, Any] = {}
+        self._import_failed = False
+        self._schema_cache: Dict[int, Dict[str, Any]] = {}
+
+    def client(self, key: str):
+        cache_key = ("http", _loop_id())
+        if cache_key in self._clients:
+            return self._clients[cache_key]
+        if self._import_failed:
+            raise ProviderUnavailable("httpx is not importable")
+        try:
+            import httpx
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=10.0),
+                limits=httpx.Limits(max_keepalive_connections=8,
+                                    max_connections=32),
+            )
+        except ImportError as exc:
+            self._import_failed = True
+            raise ProviderUnavailable("httpx is not installed") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderUnavailable("could not construct the httpx client") from exc
+        self._clients[cache_key] = client
+        return client
+
+    def _schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        cached = self._schema_cache.get(id(schema))
+        if cached is None:
+            cached = to_strict_json_schema(schema)
+            self._schema_cache[id(schema)] = cached
+        return cached
+
+    async def generate(self, model: str, key: str, prompt: str,
+                       schema: Dict[str, Any], system: str,
+                       no_thinking: Set[str]) -> Any:
+        import httpx
+
+        client = self.client(key)
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "gridwise_interpretation",
+                                "strict": True,
+                                "schema": self._schema(schema)},
+            },
+        }
+        resp = await client.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json=body,
+        )
+        if resp.status_code >= 400:
+            # Surface the status in the message so llm.py can classify it as a
+            # quota (429), a permanent failure (401/403/404) or transient.
+            detail = resp.text[:300]
+            raise RuntimeError(f"HTTP {resp.status_code} from OpenAI: {detail}")
+        data = resp.json()
+        choice = (data.get("choices") or [{}])[0]
+        if choice.get("finish_reason") == "content_filter":
+            raise RuntimeError("OpenAI refused the interpretation request")
+        text = (choice.get("message") or {}).get("content") or ""
+        return parse_payload(text, "interpretations", "choices")
+
+
+_REGISTRY = {"openai": OpenAIProvider,
+             "gemini": GeminiProvider,
+             "anthropic": AnthropicProvider}
 _INSTANCES: Dict[str, Any] = {}
 
 

@@ -14,9 +14,38 @@ to run before you submit. Commands are given for PowerShell and bash.
 |---|---|
 | Python 3.11+ | <https://www.python.org/downloads/> |
 | Docker Desktop | <https://www.docker.com/products/docker-desktop/> |
-| A **free** Gemini API key | <https://aistudio.google.com/apikey> |
+| An **OpenAI API key** (primary provider) | <https://platform.openai.com/api-keys> |
+| A **free** Gemini API key (fallback provider) | <https://aistudio.google.com/apikey> |
 | Render account | <https://render.com> (free plan is fine — see Step 6) |
 | Docker Hub account | <https://hub.docker.com> (for the fallback image) |
+
+### Provider chain
+
+The service runs a **provider chain**, not a single provider:
+
+```
+LLM_PROVIDER=openai            # primary
+LLM_FALLBACK_PROVIDERS=gemini  # tried when OpenAI is out of quota or down
+```
+
+Routes are tried in order, and key pools, circuit breakers and rate-limit
+cooldowns are tracked **per provider**:
+
+| Order | Provider | Model |
+|---|---|---|
+| 1 | openai | `gpt-5.4-mini` (measured 2.15 s) |
+| 2 | openai | `gpt-5.4-nano` |
+| 3 | gemini | `gemini-2.5-flash` |
+| 4 | gemini | `gemini-3.1-flash-lite` (measured 1.8 s) |
+| 5 | gemini | `gemini-3.5-flash` |
+| 6 | gemini | `gemini-3.5-flash-lite` |
+
+Verified by drill: with the OpenAI key invalidated, the OpenAI routes are parked
+and Gemini serves the run — still 10/10 on the public cases. Check which path is
+live at any time with `curl -s <base>/diagnostics`.
+
+To flip the order (Gemini primary), swap the two variables. To add Anthropic,
+set `LLM_FALLBACK_PROVIDERS=gemini,anthropic` and `ANTHROPIC_API_KEY`.
 
 ### About the free Gemini tier
 

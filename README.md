@@ -96,7 +96,20 @@ Names only; never commit values. Full list with defaults in `.env.example`.
 | `SCENARIO_CACHE_SIZE` / `SCENARIO_CACHE_TTL_S` | `2000` / `3600` | Full-response cache for repeated scenarios. |
 | `LOG_LEVEL`, `PORT`, `WEB_CONCURRENCY` | `INFO`, `8000`, `2` | Service settings. |
 
-**Model / provider disclosure:** Google Gemini via the `google-genai` SDK, **free tier**.
+**Model / provider disclosure:** a **provider chain**, primary first:
+
+1. **OpenAI** — `gpt-5.4-mini`, then `gpt-5.4-nano`. Chat completions with strict
+   `json_schema` structured output, temperature default, called over `httpx`
+   (the `openai` SDK 3.16 raises `RecursionError` inside
+   `ssl.SSLContext.verify_mode` when `httpx` and `httpx2` are both installed).
+2. **Google Gemini** — `gemini-2.5-flash`, then `gemini-3.1-flash-lite`,
+   `gemini-3.5-flash`, `gemini-3.5-flash-lite`. **Free tier.**
+
+Key pools, circuit breakers and rate-limit cooldowns are tracked **per provider**,
+so an exhausted or dead primary degrades to the next provider rather than to no
+LLM at all. Set `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDERS` to reorder.
+
+Legacy note: Google Gemini via the `google-genai` SDK, **free tier**.
 Primary `gemini-2.5-flash`, temperature 0, JSON structured output with an enforced
 response schema, thinking budget 0. Arbiter calls use the same chain. The fallback
 models were probed against a live free-tier key; `gemini-2.5-flash-lite`,
@@ -225,8 +238,11 @@ Measured on this build:
 | Check | Result |
 |---|---|
 | Public cases, offline optimizer | 10/10 valid, cost ratio 1.0000, p95 4 ms |
-| Public cases, full HTTP pipeline (live Gemini) | 10/10 interpretation, 10/10 valid, ratio 1.0000 |
-| Paraphrase suite | 43/43 |
+| Public cases, full HTTP pipeline (live OpenAI) | 10/10 interpretation, 10/10 valid, ratio 1.0000, **p95 2.99 s** |
+| Paraphrase suite (deterministic) | 43/43 |
+| Paraphrase suite (live LLM path) | 43/43 |
+| 24 concurrent requests | 24/24 correct, 0 errors, p95 126 ms |
+| Cross-provider failover (OpenAI key killed) | Gemini took over, 10/10 |
 | Hostile input suite | 36/36, zero 5xx, no leaked values |
 | Pytest gate | 189 passed |
 | Local test pack (`test.json`) | 92/92 interpretation notes |
