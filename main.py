@@ -27,7 +27,7 @@ log = logging.getLogger("gridwise")
 
 REQUEST_BUDGET_S = float(os.getenv("REQUEST_BUDGET_S", "25"))  # judge limit is 30s
 
-app = FastAPI(title="GridWise LLM", version="1.0.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="GridWise LLM", version="1.0.0")
 
 
 # ------------------------------------------------------------------ error handling
