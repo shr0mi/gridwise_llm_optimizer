@@ -111,7 +111,11 @@ class ScenarioRequest(BaseModel):
         json_schema_extra={"examples": [_EXAMPLE_REQUEST]},
     )
 
-    scenario_id: str = Field(description="Unique synthetic scenario identifier.")
+    scenario_id: str = Field(
+        min_length=1,
+        description="Unique synthetic scenario identifier. Must be a non-empty "
+                    "string; surrounding whitespace is stripped.",
+    )
     operator_notes: List[str] = Field(
         min_length=1, max_length=3,
         description="1-3 non-empty natural-language operator notes.")
@@ -119,6 +123,14 @@ class ScenarioRequest(BaseModel):
         min_length=24, max_length=24,
         description="Exactly 24 entries, one per hour 0-23.")
     battery: Battery
+
+    @field_validator("scenario_id")
+    @classmethod
+    def _scenario_id_non_empty(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("scenario_id must be non-empty")
+        return stripped
 
     @field_validator("operator_notes")
     @classmethod
