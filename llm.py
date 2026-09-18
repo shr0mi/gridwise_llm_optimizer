@@ -32,9 +32,14 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import config  # noqa: F401  -- loads .env before the settings below are read
 import rules
 
 log = logging.getLogger("gridwise.llm")
+
+# The SDK warns about automatic function calling on every generate_content call.
+# We pass no tools, so it is noise that would bury the signals worth reading.
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 ALLOWED = {
     "solar_reduction",
@@ -64,14 +69,22 @@ def _env_int(name: str, default: int) -> int:
 
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-# Free-tier daily caps are per model, so keep a couple of alternates ready.
+# Free-tier rate and daily caps are per model, so keep alternates ready. These
+# were probed against a live free-tier key: gemini-2.5-flash-lite, gemini-2.0-flash
+# and gemini-2.5-pro all return 404 for new keys, so they are NOT in the chain.
 FALLBACK_MODELS = [m.strip() for m in os.getenv(
-    "GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite,gemini-2.0-flash").split(",")
+    "GEMINI_FALLBACK_MODELS",
+    "gemini-flash-latest,gemini-3.5-flash,gemini-3.1-flash-lite").split(",")
     if m.strip()]
 MODEL_CHAIN: List[str] = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
 
-TIMEOUT_S = _env_float("LLM_TIMEOUT_S", 12.0)
-MAX_ATTEMPTS = _env_int("LLM_MAX_ATTEMPTS", 3)
+TIMEOUT_S = _env_float("LLM_TIMEOUT_S", 6.0)
+# One attempt per model in the chain, so a rate-limited primary walks all of it.
+MAX_ATTEMPTS = _env_int("LLM_MAX_ATTEMPTS", max(3, len(FALLBACK_MODELS) + 1))
+# Whole-interpretation ceiling. Walking the model chain must finish inside this,
+# otherwise the outer request budget kills it and the latency score suffers even
+# though the deterministic reading would have answered in milliseconds.
+TOTAL_BUDGET_S = _env_float("LLM_TOTAL_BUDGET_S", 7.0)
 MAX_CONCURRENCY = _env_int("LLM_MAX_CONCURRENCY", 4)     # free tier is ~10-15 RPM
 CACHE_SIZE = _env_int("LLM_CACHE_SIZE", 20000)
 ARBITER_ENABLED = os.getenv("LLM_ARBITER", "1").strip().lower() not in ("0", "false", "no")
@@ -475,6 +488,12 @@ def _is_quota_error(exc: BaseException) -> bool:
     return any(m in text for m in _QUOTA_MARKERS)
 
 
+def _rejects_thinking(exc: BaseException) -> bool:
+    """400 INVALID_ARGUMENT -- usually an unsupported thinking_config field."""
+    text = str(exc).lower()
+    return "invalid_argument" in text or "400" in text
+
+
 def _parse_payload(text: str) -> Any:
     """Defensive JSON parse -- structured output should not need the fallbacks."""
     text = (text or "").strip()
@@ -498,6 +517,12 @@ def _parse_payload(text: str) -> Any:
     return data
 
 
+#: Models observed to reject ``thinking_config`` with 400 INVALID_ARGUMENT. Filled
+#: in at runtime the first time a model refuses it, so the retry succeeds and every
+#: later call to that model skips the field. Gemini 3.x lite variants need this.
+_NO_THINKING: set = set()
+
+
 async def _generate(model: str, client: Any, prompt: str,
                     schema: Dict[str, Any], system: str) -> Any:
     from google.genai import types
@@ -515,11 +540,13 @@ async def _generate(model: str, client: Any, prompt: str,
         ],
     )
     # Thinking off on the extraction call: it costs seconds of latency and
-    # free-tier tokens for a task that does not need it.
-    try:
-        config.thinking_config = types.ThinkingConfig(thinking_budget=0)
-    except Exception:  # noqa: BLE001
-        pass
+    # free-tier tokens for a task that does not need it. Some models reject the
+    # field outright -- those are remembered in _NO_THINKING and skipped.
+    if model not in _NO_THINKING:
+        try:
+            config.thinking_config = types.ThinkingConfig(thinking_budget=0)
+        except Exception:  # noqa: BLE001
+            pass
 
     resp = await client.aio.models.generate_content(
         model=model, contents=prompt, config=config)
@@ -527,14 +554,26 @@ async def _generate(model: str, client: Any, prompt: str,
 
 
 async def _call_model(prompt: str, schema: Dict[str, Any] = RESPONSE_SCHEMA,
-                      system: str = SYSTEM_INSTRUCTION) -> Any:
-    """One guarded generation, walking the key pool and the model chain."""
+                      system: str = SYSTEM_INSTRUCTION,
+                      deadline: Optional[float] = None) -> Any:
+    """One guarded generation, walking the key pool and the model chain.
+
+    ``deadline`` is an absolute ``time.monotonic()`` value. Every attempt is
+    clipped to the time left, so the chain gives up in time for the caller to
+    fall back gracefully instead of being cut off mid-flight.
+    """
     if not llm_available() or _breaker.open:
         return None
+    if deadline is None:
+        deadline = time.monotonic() + TOTAL_BUDGET_S
 
     attempts = max(1, MAX_ATTEMPTS)
     last_exc: Optional[BaseException] = None
     for attempt in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining < 0.5:
+            log.warning("interpretation budget exhausted after %d attempt(s)", attempt)
+            break
         model = MODEL_CHAIN[min(attempt, len(MODEL_CHAIN) - 1)]
         client = _next_client()
         if client is None:
@@ -542,7 +581,8 @@ async def _call_model(prompt: str, schema: Dict[str, Any] = RESPONSE_SCHEMA,
         try:
             async with _semaphore():
                 payload = await asyncio.wait_for(
-                    _generate(model, client, prompt, schema, system), TIMEOUT_S)
+                    _generate(model, client, prompt, schema, system),
+                    min(TIMEOUT_S, remaining))
             if payload is not None:
                 _breaker.record_success()
                 return payload
@@ -553,12 +593,33 @@ async def _call_model(prompt: str, schema: Dict[str, Any] = RESPONSE_SCHEMA,
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if _is_quota_error(exc):
-                # Free-tier RPM/RPD hit: rotate key and drop to the next model.
+                # Free-tier RPM/RPD hit: rotate key and drop to the next model
+                # immediately -- a quota on one model says nothing about the next,
+                # so backing off here would only burn the budget.
                 log.warning("quota/rate limit on %s; rotating key and model", model)
+                continue
+            elif _rejects_thinking(exc) and model not in _NO_THINKING:
+                # The model refuses thinking_config. Remember that and retry it
+                # immediately rather than burning a chain step on a fixable error.
+                _NO_THINKING.add(model)
+                log.info("%s rejects thinking_config; retrying without it", model)
+                try:
+                    async with _semaphore():
+                        payload = await asyncio.wait_for(
+                            _generate(model, client, prompt, schema, system),
+                            min(TIMEOUT_S, max(0.5, deadline - time.monotonic())))
+                    if payload is not None:
+                        _breaker.record_success()
+                        return payload
+                except Exception as retry_exc:  # noqa: BLE001
+                    last_exc = retry_exc
+                    log.warning("model call failed on %s after retry: %s", model,
+                                type(retry_exc).__name__)
             else:
                 log.warning("model call failed on %s: %s", model, type(exc).__name__)
         if attempt < attempts - 1:
-            await asyncio.sleep(min(2.0, 0.25 * (2 ** attempt)) * (0.5 + random.random()))
+            backoff = min(2.0, 0.25 * (2 ** attempt)) * (0.5 + random.random())
+            await asyncio.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
 
     _breaker.record_failure()
     if last_exc is not None:
@@ -618,9 +679,18 @@ For each disagreement choose the candidate that follows these rules. Answer with
 
 
 async def _arbitrate(disputes: List[Tuple[int, str, Dict[str, Any], Dict[str, Any]]],
-                     battery: Dict[str, float]) -> Dict[int, str]:
-    """One bounded extra call to settle type/value disagreements."""
+                     battery: Dict[str, float],
+                     deadline: Optional[float] = None) -> Dict[int, str]:
+    """One bounded extra call to settle type/value disagreements.
+
+    Skipped when too little of the interpretation budget is left -- the primary
+    reading is already in hand, and a timeout here would cost more than the
+    arbitration is worth.
+    """
     if not disputes or not ARBITER_ENABLED:
+        return {}
+    if deadline is not None and deadline - time.monotonic() < 1.5:
+        log.info("skipping arbiter: not enough budget left")
         return {}
     lines = [f"Battery capacity is {battery.get('capacity_kwh')} kWh.", ""]
     for idx, note, a, b in disputes:
@@ -630,7 +700,8 @@ async def _arbitrate(disputes: List[Tuple[int, str, Dict[str, Any], Dict[str, An
         lines.append(f"  B: {b.get('directive_type')} "
                      f"{json.dumps(b.get('structured_adjustment'))}")
         lines.append("")
-    payload = await _call_model("\n".join(lines), _ARBITER_SCHEMA, _ARBITER_SYSTEM)
+    payload = await _call_model("\n".join(lines), _ARBITER_SCHEMA, _ARBITER_SYSTEM,
+                                deadline=deadline)
     out: Dict[int, str] = {}
     if isinstance(payload, list):
         for item in payload:
@@ -663,6 +734,7 @@ async def interpret(notes: Sequence[str], hours: Sequence[Dict[str, Any]],
     n = len(notes)
     rule_reading = rules.extract(notes, battery)
     used_fallback = False
+    deadline = time.monotonic() + TOTAL_BUDGET_S
 
     # 1. cache lookup -- repeated notes never reach the provider
     final: List[Optional[Dict[str, Any]]] = [None] * n
@@ -677,7 +749,8 @@ async def interpret(notes: Sequence[str], hours: Sequence[Dict[str, Any]],
     if pending:
         # 2. the model call -- one round trip for every uncached note
         sub_notes = [notes[i] for i in pending]
-        raw = await _call_model(build_user_prompt(sub_notes, hours, battery))
+        raw = await _call_model(build_user_prompt(sub_notes, hours, battery),
+                                deadline=deadline)
         model_reading = sanitize(raw, sub_notes, battery)
         used_fallback = raw is None
         if used_fallback:
@@ -696,7 +769,8 @@ async def interpret(notes: Sequence[str], hours: Sequence[Dict[str, Any]],
                     continue    # rules just did not parse the note; trust the model
                 disputes.append((i, notes[i], m, r))
 
-        verdicts = await _arbitrate(disputes, battery) if disputes else {}
+        verdicts = (await _arbitrate(disputes, battery, deadline)
+                    if disputes else {})
 
         for local, i in enumerate(pending):
             if used_fallback:

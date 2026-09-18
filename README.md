@@ -80,9 +80,9 @@ Names only; never commit values. Full list with defaults in `.env.example`.
 | `GEMINI_API_KEY` | — | Free Google AI Studio key. Required for the LLM path. |
 | `GEMINI_API_KEYS` | — | Optional comma-separated pool, round-robined to multiply free-tier RPM headroom. |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Primary interpretation model. |
-| `GEMINI_FALLBACK_MODELS` | `gemini-2.5-flash-lite,gemini-2.0-flash` | Tried in order when a per-model free-tier cap is hit. |
+| `GEMINI_FALLBACK_MODELS` | `gemini-flash-latest,gemini-3.5-flash,gemini-3.1-flash-lite` | Tried in order when a per-model free-tier cap is hit. |
 | `LLM_TIMEOUT_S` | `12` | Per model call. |
-| `LLM_MAX_ATTEMPTS` | `3` | Retries across keys and models on 429 / 5xx. |
+| `LLM_MAX_ATTEMPTS` | chain length | Retries across keys and models on 429 / 5xx; defaults to one attempt per model. |
 | `LLM_MAX_CONCURRENCY` | `4` | Caps in-flight model calls under the free-tier RPM ceiling. |
 | `LLM_ARBITER` | `1` | One extra call when the model and the rule reading disagree. |
 | `LLM_CACHE_SIZE` | `20000` | Normalized operator-note cache entries. |
@@ -93,7 +93,10 @@ Names only; never commit values. Full list with defaults in `.env.example`.
 
 **Model / provider disclosure:** Google Gemini via the `google-genai` SDK, **free tier**.
 Primary `gemini-2.5-flash`, temperature 0, JSON structured output with an enforced
-response schema, thinking budget 0. Arbiter calls use the same chain.
+response schema, thinking budget 0. Arbiter calls use the same chain. The fallback
+models were probed against a live free-tier key; `gemini-2.5-flash-lite`,
+`gemini-2.0-flash` and `gemini-2.5-pro` return 404 for newly created keys and are
+deliberately absent from the chain.
 
 ---
 
@@ -210,10 +213,11 @@ Measured on this build:
 | Check | Result |
 |---|---|
 | Public cases, offline optimizer | 10/10 valid, cost ratio 1.0000, p95 4 ms |
-| Public cases, full HTTP pipeline | 10/10 interpretation, 10/10 valid, ratio 1.0000 |
+| Public cases, full HTTP pipeline (live Gemini) | 10/10 interpretation, 10/10 valid, ratio 1.0000 |
 | Paraphrase suite | 43/43 |
 | Hostile input suite | 29/29, zero 5xx, no leaked values |
 | Provider-failure drill (no key / bad key) | 10/10 valid, 43/43 paraphrases |
+| Free-tier rate-limit drill (quota exhausted mid-run) | 10/10 valid — deterministic reading took over |
 
 `DEPLOY.md` has the full deployment and verification runbook.
 

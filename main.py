@@ -24,6 +24,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 
+import config  # noqa: F401  -- loads .env before any setting is read
 import llm
 import optimizer
 import replay

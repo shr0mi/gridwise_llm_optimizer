@@ -22,14 +22,25 @@ to run before you submit. Commands are given for PowerShell and bash.
 
 The free Google AI Studio key is enough for this round, but know its shape:
 
-| Model | Free RPM | Free requests/day |
-|---|---|---|
-| `gemini-2.5-flash` | ~10 | ~250 |
-| `gemini-2.5-flash-lite` | ~15 | ~1000 |
-| `gemini-2.0-flash` | ~15 | ~200 |
+**Measured against a live free key on this build:** `gemini-2.5-flash` returns
 
-Limits are **per model and per project**, and they move — treat the table as an order of
-magnitude, not a contract. The service is built for this:
+```
+429 RESOURCE_EXHAUSTED ... Quota exceeded for metric:
+generativelanguage.googleapis.com/generate_content_free_tier_requests,
+limit: 20, model: gemini-2.5-flash. Please retry in 25.8s
+```
+
+So the binding constraint is **20 requests per minute, per model, per project** — a
+*per-minute* cap, not your daily allowance. A burst of ten scenarios back to back will hit
+it; requests spaced a few seconds apart will not.
+
+Models were probed against that same key. These are **dead for newly created keys** and
+must not be in the chain: `gemini-2.5-flash-lite`, `gemini-2.0-flash`, `gemini-2.5-pro`
+(all 404). These work: `gemini-2.5-flash`, `gemini-flash-latest`, `gemini-3.5-flash`,
+`gemini-3.1-flash-lite`. `gemini-3.5-flash-lite` works only without a thinking budget —
+the service detects that and retries without the field automatically.
+
+The service is built for all of this:
 
 - `LLM_MAX_CONCURRENCY=4` keeps in-flight calls under the RPM ceiling.
 - A 429 rotates the key **and** steps to the next model in `GEMINI_FALLBACK_MODELS`.
@@ -37,12 +48,18 @@ magnitude, not a contract. The service is built for this:
 - If everything is exhausted, the deterministic extractor answers and the service keeps
   returning valid 200s.
 
-**Strongly recommended:** create 2–3 free keys in **different Google Cloud projects** and
-set them as a pool. This multiplies your headroom for the cost of one env var:
+**Strongly recommended — this is the single highest-value change you can make.** The quota
+is per *project*, so create 2–3 more free keys in **different Google Cloud projects** and
+set them as a pool. Three keys turn 20 RPM into 60 RPM for the cost of one env var:
 
 ```
 GEMINI_API_KEYS=key_one,key_two,key_three
 ```
+
+With one key, a ten-scenario burst exhausts the minute and the service answers the rest
+from the deterministic reading — correct, but it forfeits the "LLM produced this" path on
+those cases and adds latency while the chain is walked. With three keys that does not
+happen.
 
 ---
 
@@ -133,7 +150,7 @@ scans every response body for leaked keys, prompts and stack traces.
 Point the service at a key that cannot work, restart it, and re-run 2d:
 
 ```powershell
-$env:GEMINI_API_KEY = "AIzaSyINVALID-not-a-real-key"
+$env:GEMINI_API_KEY = "deliberately-invalid-key"
 uvicorn main:app --port 8000
 ```
 
@@ -179,7 +196,8 @@ git push origin main
 Before pushing, confirm no secrets are tracked:
 
 ```bash
-git grep -nEi "AIza[0-9A-Za-z_-]{10,}|api[_-]?key\s*=\s*[\"'][^\"']+" -- . ':!*.md'
+# Google AI Studio keys appear as either AIza... or AQ.Ab8... -- check for both.
+git grep -nE "AIza[0-9A-Za-z_-]{20,}|AQ\.[A-Za-z0-9_-]{20,}" -- .
 # expect: no output
 ```
 
