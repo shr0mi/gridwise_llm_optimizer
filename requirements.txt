@@ -1,0 +1,6 @@
+fastapi==0.123.5
+uvicorn[standard]==0.38.0
+pydantic==2.12.5
+numpy==2.2.6
+scipy==1.16.3
+google-genai==2.24.0
