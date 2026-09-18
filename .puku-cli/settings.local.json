@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E '\\\\.\\(py|md|json|yaml|txt|env\\)$')",
+      "Bash(python3:*)"
+    ]
+  }
+}
